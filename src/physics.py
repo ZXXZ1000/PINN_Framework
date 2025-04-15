@@ -11,6 +11,7 @@ import logging
 import warnings
 import time
 from typing import Dict, Tuple, Union, Optional, List
+import inspect # Import inspect for checking function signature
 
 # --- Helper Functions for IDA/D∞ Drainage Area ---
 
@@ -144,120 +145,95 @@ def _build_W_matrix_torch_sparse(
     return W_sparse
 
 def _richardson_solver(
-    W: torch.Tensor, b: torch.Tensor, a_init: Optional[torch.Tensor] = None,
-    omega: float = 0.5, max_iters: int = 2000, tol: float = 1e-6, verbose: bool = False,
-    max_value: float = 1e6, stabilize: bool = True
+    W: torch.Tensor,  # Sparse matrix (N, N)
+    b: torch.Tensor,  # Dense vector (N,)
+    a_init: Optional[torch.Tensor] = None,
+    omega: float = 0.5,
+    max_iters: int = 2000,
+    tol: float = 1e-6,
+    verbose: bool = False
 ) -> Tuple[torch.Tensor, bool]:
-    """Solves Wa = b using Richardson iteration (PyTorch sparse) with enhanced stability."""
+    """
+    Solves Wa = b using Richardson iteration (Simpler version from Drainage_area_cal.py).
+    """
     N = b.shape[0]
-    device, dtype = b.device, b.dtype
-    a = torch.zeros(N, device=device, dtype=dtype) if a_init is None else a_init.clone()
+    device = b.device
+    dtype = b.dtype
+    if a_init is None:
+        a = torch.zeros(N, device=device, dtype=dtype)
+    else:
+        a = a_init.clone()
 
-    # Ensure b is well-conditioned
     b_norm = torch.linalg.norm(b)
-    if b_norm < 1e-15: return a, True
-
-    # Initialize variables for adaptive relaxation
-    omega_k = omega
-    best_a = a.clone()
-    best_rel_res = float('inf')
-    stagnation_counter = 0
-    prev_rel_res = float('inf')
+    if b_norm < 1e-15:
+        return a, True
 
     converged = False
+    # Check diagonal (optional, from Drainage_area_cal.py)
+    # W_diag_indices = W._indices()[0] == W._indices()[1]
+    # W_diag_values = W._values()[W_diag_indices]
+    # if not torch.all(W_diag_values == 1.0):
+    #     warnings.warn("W matrix diagonal elements are not all 1.0. This may cause instability.", RuntimeWarning)
+
     for k in range(max_iters):
-        # Compute residual
+        # Compute residual r = b - W * a
         Wa = torch.sparse.mm(W, a.unsqueeze(1)).squeeze(1)
         r = b - Wa
+
         r_norm = torch.linalg.norm(r)
         rel_res = r_norm / (b_norm + tol)
 
         # Check for numerical issues
         if torch.isnan(r_norm) or torch.isinf(r_norm):
-            warnings.warn(f"Richardson solver: Instability detected at iter {k+1}. Stopping.", RuntimeWarning)
-            return best_a if stabilize else a, False
+            warnings.warn(f"Numerical instability detected at iteration {k+1}. Stopping early.", RuntimeWarning)
+            return a, False # Return current 'a'
 
-        # Log progress
         if verbose and (k % 50 == 0 or k == max_iters - 1):
-            logging.info(f"Richardson Iter {k+1}/{max_iters} - Rel Residual: {rel_res:.3e}, omega: {omega_k:.3e}")
+            logging.info(f"Richardson Iteration {k+1}/{max_iters} - Relative Residual: {rel_res:.3e}")
 
-        # Check convergence
         if rel_res < tol:
             converged = True
-            if verbose: logging.info(f"Richardson solver converged in {k+1} iterations.")
+            if verbose:
+                logging.info(f"Richardson solver converged in {k+1} iterations.")
             break
 
-        # Save best result so far
-        if rel_res < best_rel_res:
-            best_rel_res = rel_res
-            best_a = a.clone()
-            stagnation_counter = 0
-        else:
-            stagnation_counter += 1
-
-        # Adaptive relaxation: reduce omega if progress stalls
-        if stabilize and stagnation_counter > 10:
-            omega_k *= 0.9  # Reduce omega
-            stagnation_counter = 0
-            if verbose:
-                logging.info(f"Reducing omega to {omega_k:.3e} due to stagnation")
-
-        # Check for divergence
-        if rel_res > prev_rel_res * 2 and k > 10:
-            if stabilize:
-                # Restart with smaller omega
-                omega_k *= 0.5
-                a = best_a.clone()
-                if verbose:
-                    logging.info(f"Divergence detected. Restarting with omega={omega_k:.3e}")
-            else:
-                warnings.warn(f"Richardson solver: Divergence detected at iter {k+1}. Stopping.", RuntimeWarning)
-                return best_a, False
-
-        # Update solution with relaxation
-        a += omega_k * r
-
-        # Clamp to prevent extreme values during iteration
-        if stabilize:
-            a = torch.clamp(a, min=0.0, max=max_value)
-
-        prev_rel_res = rel_res
+        # Update: a = a + omega * r
+        a += omega * r
 
     if not converged:
-        warnings.warn(f"Richardson solver did not converge in {max_iters} iterations. Final rel res: {rel_res:.3e}", RuntimeWarning)
+        warnings.warn(f"Richardson solver did not converge in {max_iters} iterations. Final relative residual: {rel_res:.3e}", RuntimeWarning)
 
-    # Return best solution found
-    result = best_a if stabilize else a
-    result = torch.clamp(result, min=0.0)  # Ensure non-negative area
-    return result, converged
+    # Clamp at the end
+    a = torch.clamp(a, min=0.0)
+    return a, converged
 
 class IDASolveRichardson(torch.autograd.Function):
-    """Custom autograd function for IDA Richardson solver with enhanced stability."""
+    """Custom autograd function for IDA Richardson solver."""
     @staticmethod
-    def forward(ctx, W_rows, W_cols, W_vals_offdiag, b_flat, N_total, omega, solver_max_iters, solver_tol, verbose, max_value=1e6, stabilize=True):
+    def forward(ctx, W_rows, W_cols, W_vals_offdiag, b_flat, N_total, omega, solver_max_iters, solver_tol, verbose): # Signature without stabilize/max_value
         device, dtype = b_flat.device, b_flat.dtype
         W_sparse = _build_W_matrix_torch_sparse(W_rows, W_cols, W_vals_offdiag, N_total, device, dtype)
+        # Call the simpler solver
         a_flat, _ = _richardson_solver(
-            W_sparse, b_flat, None, omega, solver_max_iters, solver_tol,
-            verbose=verbose, max_value=max_value, stabilize=stabilize
+            W_sparse, b_flat, None, omega, solver_max_iters, solver_tol, verbose=verbose
         )
         ctx.W_sparse = W_sparse
         ctx.a = a_flat
         ctx.W_rows, ctx.W_cols = W_rows, W_cols # Save indices for grad_W calculation
         ctx.omega, ctx.solver_max_iters, ctx.solver_tol = omega, solver_max_iters, solver_tol
-        ctx.verbose, ctx.max_value, ctx.stabilize = verbose, max_value, stabilize
+        ctx.verbose = verbose # Save correct context
         return a_flat
 
     @staticmethod
     def backward(ctx, grad_output):
         W_sparse, a, W_rows, W_cols = ctx.W_sparse, ctx.a, ctx.W_rows, ctx.W_cols
         omega, solver_max_iters, solver_tol = ctx.omega, ctx.solver_max_iters, ctx.solver_tol
-        verbose, max_value, stabilize = ctx.verbose, ctx.max_value, ctx.stabilize
+        verbose = ctx.verbose # Load correct context
 
         grad_output_detached = grad_output.detach()
+        # Call simpler solver for backward pass
         grad_a, converged_bwd = _richardson_solver(
-            W_sparse.T.coalesce(), grad_output_detached, None, omega, solver_max_iters, solver_tol,
-            verbose=verbose, max_value=max_value, stabilize=stabilize
+            W_sparse.T.coalesce(), grad_output_detached, None, omega, solver_max_iters, solver_tol, verbose=verbose
         )
         if not converged_bwd:
             warnings.warn("Richardson solver for backward pass did not converge!", RuntimeWarning)
@@ -268,9 +244,8 @@ class IDASolveRichardson(torch.autograd.Function):
         # dL/d(-w_ji) = dL/dW_ij = - grad_a[i] * a[j]
         grad_W_vals_offdiag = -grad_a[W_rows] * a[W_cols]
 
-        # Gradients for W_rows, W_cols, b_flat, N_total, omega, iters, tol, verbose, max_value, stabilize
-        # Return None for non-tensor inputs or inputs that don't require grad
-        return None, None, grad_W_vals_offdiag, grad_b, None, None, None, None, None, None, None
+        # Return correct number of gradients for forward inputs
+        return None, None, grad_W_vals_offdiag, grad_b, None, None, None, None, None
 
 # --- Main IDA/D∞ Drainage Area Function ---
 
@@ -279,13 +254,12 @@ def calculate_drainage_area_ida_dinf_torch(
     dx: float,
     dy: float,
     precip: Union[float, torch.Tensor] = 1.0,
-    omega: float = 0.5, # Reduced default relaxation factor for better stability
-    solver_max_iters: int = 5000,
-    solver_tol: float = 1e-6,
+    omega: float = 0.5, # Default from simpler solver
+    solver_max_iters: int = 2000, # Default from simpler solver
+    solver_tol: float = 1e-6,   # Default from simpler solver
     eps: float = 1e-10,
-    verbose: bool = False,
-    max_value: float = 1e6,
-    stabilize: bool = True
+    verbose: bool = False
+    # Removed max_value and stabilize parameters from signature
 ) -> torch.Tensor:
     """
     Calculates differentiable drainage area using the IDA framework and D-infinity flow routing (PyTorch).
@@ -324,12 +298,18 @@ def calculate_drainage_area_ida_dinf_torch(
     # --- Solve Wa = b using custom autograd function ---
     if verbose: logging.info("Solving Wa = b using Richardson iteration...")
     start_time_solve = time.time()
-    # Pass all parameters to the apply method
+
+    # Call apply with the simplified signature
     a_flat = IDASolveRichardson.apply(
         rows, cols, W_vals_offdiag, b_flat, N_total,
-        omega, solver_max_iters, solver_tol, verbose,
-        max_value, stabilize
+        omega, solver_max_iters, solver_tol, verbose
     )
+
+    # Check if the result contains NaN or inf values
+    if torch.isnan(a_flat).any() or torch.isinf(a_flat).any():
+        if verbose: logging.warning("NaN or Inf values detected in IDA solution. Replacing with zeros.")
+        a_flat = torch.where(torch.isnan(a_flat) | torch.isinf(a_flat), torch.zeros_like(a_flat), a_flat)
+
     if verbose: logging.info(f"Linear solver took {time.time() - start_time_solve:.3f}s")
 
     # --- Reshape solution ---
@@ -437,7 +417,7 @@ def calculate_dhdt_physics(
         precip: Precipitation for drainage area calculation (scalar or tensor).
         padding_mode: Padding mode for derivatives.
         da_params: Parameters dictionary for calculate_drainage_area_ida_dinf_torch
-                   (e.g., {'omega': 1.0, 'solver_max_iters': 2000, 'solver_tol': 1e-7}).
+                   (e.g., {'omega': 0.5, 'solver_max_iters': 2000, 'solver_tol': 1e-6}).
 
     Returns:
         The calculated dh/dt based on physics (B, 1, H, W).
@@ -453,18 +433,20 @@ def calculate_dhdt_physics(
 
     # Calculate drainage area using the IDA/D-infinity method
     if da_params is None: da_params = {}
-    # Map common names if necessary or ensure config uses correct names
+    # Correctly define ida_dinf_kwargs using defaults from the simplified function signature
     ida_dinf_kwargs = {
-        'omega': da_params.get('omega', 0.5), # Reduced default omega for better stability
-        'solver_max_iters': da_params.get('solver_max_iters', 5000),
-        'solver_tol': da_params.get('solver_tol', 1e-6),
+        'omega': da_params.get('omega', 0.5), # Default from simpler solver
+        'solver_max_iters': da_params.get('solver_max_iters', 2000), # Default from simpler solver
+        'solver_tol': da_params.get('solver_tol', 1e-6), # Default from simpler solver
         'eps': da_params.get('eps', 1e-10),
-        'verbose': da_params.get('verbose', False),
-        'max_value': da_params.get('max_value', 1e6),
-        'stabilize': da_params.get('stabilize', True)
+        'verbose': da_params.get('verbose', False)
     }
+    # Filter out any unexpected keys just in case da_params contains extras
+    sig = inspect.signature(calculate_drainage_area_ida_dinf_torch)
+    valid_kwargs = {k: v for k, v in ida_dinf_kwargs.items() if k in sig.parameters}
+
     drainage_area = calculate_drainage_area_ida_dinf_torch(
-        h, dx, dy, precip=precip, **ida_dinf_kwargs
+        h, dx, dy, precip=precip, **valid_kwargs
     )
 
     # Calculate erosion rate

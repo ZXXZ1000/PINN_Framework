@@ -137,6 +137,22 @@ class AdaptiveFastscapePINN(TimeDerivativePINN):
         self.max_resolution = max_resolution
         self.coordinate_input_dim = coordinate_input_dim
 
+        # Initialize physics parameters with defaults
+        self.physics_params = {
+            'dx': 1.0,
+            'dy': 1.0,
+            'precip': 1.0,
+            'da_params': {
+                'omega': 0.3,            # Reduced relaxation factor for better stability
+                'solver_max_iters': 5000, # Increased max iterations
+                'solver_tol': 1e-5,      # Adjusted tolerance
+                'eps': 1e-10,            # Small epsilon for numerical stability
+                'verbose': False,         # Verbose output for debugging
+                'stabilize': True,        # Enable stabilization
+                'use_fallback': True      # Enable fallback to simpler method if convergence fails
+            }
+        }
+
         # Store domain boundaries
         # Handle OmegaConf ListConfig objects and other sequence types
         # First convert to Python lists if possible
@@ -717,6 +733,15 @@ class AdaptiveFastscapePINN(TimeDerivativePINN):
         k_field = prepare_parameter(params.get('K'), input_shape, batch_size, device, dtype)
         u_field = prepare_parameter(params.get('U'), input_shape, batch_size, device, dtype)
 
+        # Extract additional parameters for physics calculations if provided
+        # These will be passed to the physics functions in the forward pass
+        self.physics_params = {
+            'dx': params.get('dx', 1.0),
+            'dy': params.get('dy', 1.0),
+            'precip': params.get('precip', 1.0),
+            'da_params': params.get('da_params', {})
+        }
+
         # Choose processing strategy based on input size
         if max(input_shape) <= self.base_resolution:
             logging.debug(f"Input size {input_shape} <= base_resolution {self.base_resolution}. Using direct CNN.")
@@ -740,6 +765,7 @@ class AdaptiveFastscapePINN(TimeDerivativePINN):
                - mode='predict_state': 字典或元组 (initial_state, params, t_target)
                                         initial_state: [B, 1, H, W] or [B, H, W]
                                         params: 字典，包含 'K', 'U' (标量, [B], [H,W], [B,H,W], or [B,1,H,W])
+                                                以及可选的 'dx', 'dy', 'precip', 'da_params' 用于物理计算
                                         t_target: 标量, [B], or [B, 1]
             mode (str): 'predict_coords' 或 'predict_state'
 

@@ -72,7 +72,8 @@ def e2e_config(temp_e2e_dirs):
             'save_best_only': False, # Save last epoch for verification
             'save_interval': 1,
             'load_checkpoint': None,
-            'use_mixed_precision': False
+            'use_mixed_precision': False,
+            'results_dir': 'PINN_Framework/results' # Explicitly set results dir relative to workspace root
         }
     }
     # Save config to file for loading
@@ -97,10 +98,9 @@ def create_dummy_e2e_data(temp_e2e_dirs):
             'n': torch.tensor(1.0),
             'run_time': torch.tensor(1000.0 * (i + 1))
         }
-        # Note: Saving without channel dim, ensure dataloader handles this or adjust saving
-        # Let's assume dataloader adds channel dim if needed, or save with channel dim
-        data_with_channel = {k: v.unsqueeze(0) if isinstance(v, torch.Tensor) and v.ndim == 3 else v for k, v in data.items()}
-        torch.save(data_with_channel, data_dir / f"sample_{i:02d}.pt")
+        # Note: Saving with channel dim (1, H, W) as expected by dataloader/model
+        # The original data['initial_topo'] is already (1, H, W)
+        torch.save(data, data_dir / f"sample_{i:02d}.pt") # Save the original data dict
 
 # --- 端到端测试 ---
 

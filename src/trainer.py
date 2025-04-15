@@ -397,8 +397,13 @@ class PINNTrainer:
             epoch_start_time = time.time()
 
             # --- Training Epoch ---
-            train_loss, train_loss_components = self._run_epoch(epoch, is_training=True)
-            logging.info(f"Epoch {epoch} Train Loss: {train_loss:.6f}")
+            try:
+                train_loss, train_loss_components = self._run_epoch(epoch, is_training=True)
+                logging.info(f"Epoch {epoch} Train Loss: {train_loss:.6f}")
+            except Exception as e_train:
+                logging.error(f"Error during training epoch {epoch}: {e_train}", exc_info=True)
+                break # Stop training if an epoch fails
+
             self.writer.add_scalar('Loss/Train', train_loss, epoch)
             for name, value in train_loss_components.items():
                 self.writer.add_scalar(f'LossComponents/Train/{name}', value, epoch)
@@ -406,8 +411,13 @@ class PINNTrainer:
             # --- Validation Epoch ---
             val_loss = float('inf')
             if self.val_loader and (epoch + 1) % val_interval == 0:
-                val_loss, val_loss_components = self._run_epoch(epoch, is_training=False)
-                logging.info(f"Epoch {epoch} Val Loss: {val_loss:.6f}")
+                try:
+                    val_loss, val_loss_components = self._run_epoch(epoch, is_training=False)
+                    logging.info(f"Epoch {epoch} Val Loss: {val_loss:.6f}")
+                except Exception as e_val:
+                    logging.error(f"Error during validation epoch {epoch}: {e_val}", exc_info=True)
+                    val_loss = float('inf') # Treat validation error as infinite loss
+                    val_loss_components = {}
                 self.writer.add_scalar('Loss/Val', val_loss, epoch)
                 for name, value in val_loss_components.items():
                     self.writer.add_scalar(f'LossComponents/Val/{name}', value, epoch)
@@ -452,6 +462,7 @@ class PINNTrainer:
 
     def save_checkpoint(self, epoch: int, filename: str, is_best: bool = False):
         """Saves model checkpoint."""
+        logging.info(f"Attempting to save checkpoint: epoch={epoch}, filename={filename}, is_best={is_best}") # Add logging
         # Resolve OmegaConf config if necessary
         try:
             from omegaconf import OmegaConf, DictConfig
@@ -474,13 +485,13 @@ class PINNTrainer:
 
         filepath = os.path.join(self.checkpoint_dir, filename)
         try:
-            # 直接使用 weights_only=False，因为我们的数据包含 numpy 数组
-            torch.save(state, filepath, weights_only=False)
+            # 移除 weights_only 以兼容旧版本 PyTorch
+            torch.save(state, filepath)
             logging.info(f"Checkpoint saved to {filepath}")
             if is_best:
                  best_filepath = os.path.join(self.checkpoint_dir, 'best_model.pth')
-                 # 直接使用 weights_only=False，因为我们的数据包含 numpy 数组
-                 torch.save(state, best_filepath, weights_only=False) # Overwrite best model
+                 # 移除 weights_only 以兼容旧版本 PyTorch
+                 torch.save(state, best_filepath) # Overwrite best model
                  logging.info(f"Best model checkpoint updated: {best_filepath}")
         except Exception as e:
              logging.error(f"Failed to save checkpoint {filepath}: {e}", exc_info=True)
