@@ -2,13 +2,14 @@
 # 数据生成脚本 (scripts/generate_data.py) 的配置文件
 
 data_generation:
-  num_samples: 500              # 每个分辨率要生成的样本数量
+  num_samples: 5000              # 每个分辨率要生成的样本数量
   base_output_dir: data/processed # 保存处理后 .pt 文件的主目录 (相对路径)
 
   # --- 多分辨率设置 ---
   resolutions:                  # 要生成的数据的分辨率列表 [(H1, W1), (H2, W2), ...]
     - [64, 64]
-    # - [128, 128] # 可以取消注释以生成更高分辨率的数据
+    - [128, 128] # 生成更高分辨率的数据
+    - [256, 256] # 可选：生成更高分辨率的数据
 
   domain_size_x: 10000.0        # 模拟域的物理宽度 (例如，米)
   domain_size_y: 10000.0        # 模拟域的物理高度 (例如，米)
@@ -36,6 +37,13 @@ data_generation:
       pattern: 'constant'         # 示例：K_f 保持常量（但仍作为空间场处理）
       min: 2.0e-5                 # 常量值
       max: 2.0e-5                 # 常量值
+
+  # --- 初始地形设置 ---
+  initial_topography:
+    method: 'sine_mix'           # 初始地形生成方法: 'flat', 'sine', 'sine_mix', 'smooth_noise', 'random'
+    amplitude: 10.0              # 地形振幅 (米)
+    frequency: 1.5               # 空间频率 (对于正弦波方法)
+    seed: 42                     # 随机种子 (对于随机方法，设为null则每次生成不同地形)
 
   # --- 模拟参数 ---
   simulation_params:

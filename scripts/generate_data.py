@@ -91,6 +91,32 @@ def sample_scalar_parameters(param_ranges: Dict[str, Union[List[float], float]])
     logging.debug(f"采样的标量参数 (初始): {sampled_params}")
     return sampled_params
 
+# --- 辅助函数：生成多样化初始地形 ---
+def generate_initial_topography(shape: Tuple[int, int], method: str = 'flat', amplitude: float = 1.0, frequency: float = 2.0, seed: int = None) -> np.ndarray:
+    """生成多样化初始地形，包括正弦波叠加、平滑噪声等。"""
+    if seed is not None:
+        np.random.seed(seed)
+    h, w = shape
+    if method == 'sine':
+        y = np.linspace(0, 2 * np.pi * frequency, h)
+        x = np.linspace(0, 2 * np.pi * frequency, w)
+        X, Y = np.meshgrid(x, y)
+        topo = amplitude * (np.sin(X) + np.sin(Y))
+    elif method == 'sine_mix':
+        y = np.linspace(0, 2 * np.pi * frequency, h)
+        x = np.linspace(0, 2 * np.pi * frequency, w)
+        X, Y = np.meshgrid(x, y)
+        topo = amplitude * (np.sin(X) + 0.5 * np.sin(2*Y) + 0.3 * np.sin(3*X + Y))
+    elif method == 'smooth_noise':
+        from scipy.ndimage import gaussian_filter
+        noise = np.random.randn(h, w)
+        topo = amplitude * gaussian_filter(noise, sigma=min(h, w)//16)
+    elif method == 'random':
+        topo = amplitude * np.random.uniform(-1, 1, (h, w))
+    else:  # flat
+        topo = np.zeros((h, w), dtype=np.float32)
+    return topo.astype(np.float32)
+
 # --- 辅助函数：生成单个模拟样本 ---
 def generate_single_sample(sample_index: int, config: Dict) -> bool:
     """根据提供的配置生成并保存单个模拟样本。"""
@@ -108,6 +134,13 @@ def generate_single_sample(sample_index: int, config: Dict) -> bool:
     scalar_param_ranges = data_gen_config.get('parameter_ranges', {})
     spatial_param_config = data_gen_config.get('spatial_parameter_config', {})
     output_dir = data_gen_config.get('output_dir') # 从特定分辨率的配置中获取
+
+    # 新增：读取初始地形生成方式配置
+    initial_topo_config = data_gen_config.get('initial_topography', {})
+    initial_topo_method = initial_topo_config.get('method', 'flat')
+    initial_topo_amplitude = float(initial_topo_config.get('amplitude', 1.0))
+    initial_topo_frequency = float(initial_topo_config.get('frequency', 2.0))
+    initial_topo_seed = initial_topo_config.get('seed', None)
 
     if not output_dir:
         logging.error(f"样本 {sample_index+1}: 配置中缺少 'output_dir'。无法保存样本。")
@@ -142,7 +175,7 @@ def generate_single_sample(sample_index: int, config: Dict) -> bool:
                       logging.debug(f"未找到空间参数 '{key}' 的配置。将保持标量。")
             final_params.update(spatial_params) # 如果生成了空间场，则覆盖标量值
 
-        logging.debug(f"样本 {sample_index+1} 的最终参数: { {k: type(v).__name__ for k, v in final_params.items()} }")
+        logging.debug(f"样本 {sample_index+1} 的最终参数: {{ {k: type(v).__name__ for k, v in final_params.items()} }}")
 
         # 2. 设置 xsimlab 模拟
         sim_times = np.arange(0, run_time_total + time_step, time_step)
@@ -195,8 +228,9 @@ def generate_single_sample(sample_index: int, config: Dict) -> bool:
              initial_topo_xr = out_ds['topography__elevation'].sel(out=0, method='nearest')
              final_topo_xr = out_ds['topography__elevation'].sel(out=run_time_total, method='nearest')
 
-        # 转换为张量，添加通道维度 [1, H, W]
-        initial_topo_tensor = torch.from_numpy(initial_topo_xr.values.astype(np.float32)).unsqueeze(0)
+        # 新增：用动态采样的初始地形替换 initial_topo_tensor
+        initial_topo_np = generate_initial_topography(grid_shape, method=initial_topo_method, amplitude=initial_topo_amplitude, frequency=initial_topo_frequency, seed=initial_topo_seed)
+        initial_topo_tensor = torch.from_numpy(initial_topo_np).unsqueeze(0)
         final_topo_tensor = torch.from_numpy(final_topo_xr.values.astype(np.float32)).unsqueeze(0)
 
         # 准备保存的字典
@@ -225,7 +259,7 @@ def generate_single_sample(sample_index: int, config: Dict) -> bool:
 
     except Exception as e:
         logging.error(f"生成或保存样本 {sample_index+1} 失败: {e}", exc_info=True)
-        return False # 指示失败
+        return False
 
 # --- 辅助函数：生成特定分辨率的数据集 ---
 def generate_dataset_for_resolution(config: Dict):
