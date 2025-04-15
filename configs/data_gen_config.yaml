@@ -1,0 +1,116 @@
+# PINN_Framework/configs/data_gen_config.yaml
+# 数据生成脚本 (scripts/generate_data.py) 的配置文件
+
+data_generation:
+  num_samples: 500              # 每个分辨率要生成的样本数量
+  base_output_dir: data/processed # 保存处理后 .pt 文件的主目录 (相对路径)
+
+  # --- 多分辨率设置 ---
+  resolutions:                  # 要生成的数据的分辨率列表 [(H1, W1), (H2, W2), ...]
+    - [64, 64]
+    # - [128, 128] # 可以取消注释以生成更高分辨率的数据
+
+  domain_size_x: 10000.0        # 模拟域的物理宽度 (例如，米)
+  domain_size_y: 10000.0        # 模拟域的物理高度 (例如，米)
+
+  # --- 参数生成设置 ---
+  parameter_type: spatial       # 参数类型: 'scalar' 或 'spatial'
+                                # 'spatial' 允许 uplift_rate 和 k_f 空间变化
+
+  # 标量参数采样范围 (即使在 'spatial' 模式下，这些也用作空间场的基础范围或非空间参数的值)
+  # 注意：键名需要匹配 fastscape/xsimlab 模型中的输入变量名
+  parameter_ranges:
+    uplift__rate: [0.0001, 0.001]   # 抬升率 U (m/yr)
+    spl__k_coef: [1.0e-6, 5.0e-5]   # 河流侵蚀系数 K_f
+    diffusion__diffusivity: [0.01, 0.1] # 坡面扩散系数 K_d
+    spl__area_exp: [0.4, 0.6]       # 汇水面积指数 m (通常为标量)
+    spl__slope_exp: [1.0, 1.0]      # 坡度指数 n (通常固定为 1.0)
+
+  # 空间变化参数配置 (仅当 parameter_type: 'spatial' 时使用)
+  spatial_parameter_config:
+    uplift__rate:                 # 配置空间变化的抬升率 U
+      pattern: 'random'           # 模式: 'constant', 'random', 'fault'
+      min: 0.0001                 # 空间场最小值 (覆盖 parameter_ranges 中的值)
+      max: 0.001                  # 空间场最大值 (覆盖 parameter_ranges 中的值)
+    spl__k_coef:                  # 配置空间变化的侵蚀系数 K_f
+      pattern: 'constant'         # 示例：K_f 保持常量（但仍作为空间场处理）
+      min: 2.0e-5                 # 常量值
+      max: 2.0e-5                 # 常量值
+
+  # --- 模拟参数 ---
+  simulation_params:
+    run_time: 50000.0             # 总模拟时间 (例如，年)
+    time_step: 500.0              # fastscape 内部时间步长 (影响稳定性)
+    boundary__status: 'fixed_value' # 边界条件类型 (例如, 'fixed_value', 'closed')
+    # grid_shape 和 grid_length 由 resolutions 和 domain_size_* 自动处理
+
+# --- 日志配置 (可选) ---
+# logging:
+#   log_dir: logs/data_generation
+#   log_filename: generate_data.log
+#   log_level: INFO
+
+# --- 运行选项 (可选, 如果 train.py/optimize.py 需要) ---
+# run_options:
+#   output_dir: results/ # 训练/优化结果的基础目录
+#   device: auto         # 'auto', 'cuda', 'cpu'
+
+# --- 模型配置 (示例, 主要用于 train.py/optimize.py) ---
+# model:
+#   name: AdaptiveFastscapePINN # 固定的模型名称
+#   output_dim: 1
+#   hidden_dim: 256
+#   num_layers: 8
+#   base_resolution: 64
+#   max_resolution: 1024
+#   activation_fn: Tanh # 需要在代码中映射到 torch.nn.Tanh
+#   coordinate_input_dim: 5
+#   dtype: float32
+
+# --- 训练配置 (示例, 用于 train.py) ---
+# training:
+#   batch_size: 16
+#   max_epochs: 500
+#   learning_rate: 1e-4
+#   optimizer: AdamW
+#   weight_decay: 1e-5
+#   lr_scheduler: Cosine
+#   lr_scheduler_config:
+#     t_max: ${training.max_epochs} # 使用 OmegaConf 插值
+#     eta_min: 1e-7
+#   loss_weights:
+#     data: 1.0
+#     physics: 0.1
+#     smoothness: 0.001
+#   seed: 42
+#   use_mixed_precision: True
+#   checkpoint_freq: 50
+#   save_best_only: True
+#   run_name: pinn_train_run_${now:%Y%m%d_%H%M%S} # 使用 OmegaConf 时间戳
+
+# --- 优化配置 (示例, 用于 optimize.py) ---
+# optimization:
+#   run_name: pinn_optimize_run_${now:%Y%m%d_%H%M%S}
+#   pinn_checkpoint_path: results/pinn_train_run_.../checkpoints/best_model.pth # 需要指定训练好的模型
+#   target_dem_path: data/observations/target_dem.npy # 需要提供观测数据
+#   fixed_inputs: # 提供初始状态和固定的物理参数
+#     initial_topography: data/observations/initial_topo.npy
+#   fixed_parameters:
+#     K: 1.5e-5 # 固定 K_f
+#     D: 0.05   # 固定 K_d
+#     m: 0.5
+#     n: 1.0
+#   parameters_to_optimize: # 配置要优化的参数
+#     U: # 优化抬升率 U
+#       initial_guess_type: constant # 'constant', 'random'
+#       initial_value: 0.0005       # 初始猜测值
+#       bounds: [0.0, 0.002]        # 优化边界 [min, max]
+#       # parameter_shape: [10, 10] # 可选：如果使用低分辨率参数化
+#   t_target: 50000.0 # 观测数据对应的时间
+#   optimization_params: # PyTorch 优化器参数
+#     optimizer: AdamW
+#     learning_rate: 1e-4
+#     max_iterations: 500
+#     spatial_smoothness_weight: 1e-1 # 正则化权重
+#     log_interval: 20
+#     output_filename: optimized_U.pth # 输出文件名

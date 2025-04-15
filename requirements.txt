@@ -1,0 +1,13 @@
+# PINN_Framework/requirements.txt
+# Core dependencies are managed by environment.yml (Conda)
+
+# Development/Testing Dependencies (Install via pip after creating Conda env)
+pytest
+pytest-mock
+omegaconf
+
+# Other potential dependencies (uncomment if needed and not available via Conda)
+# scipy
+# matplotlib # For visualization
+# netcdf4 # If fastscape outputs netcdf
+# scikit-image # Potential use in data processing/analysis

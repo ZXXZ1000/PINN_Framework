@@ -1,0 +1,102 @@
+# PINN_Framework/configs/train_config.yaml
+# 模型训练脚本 (scripts/train.py) 的配置文件
+
+# --- 通用设置 ---
+output_dir: results/                     # 保存结果的基础目录 (相对路径)
+run_name: pinn_train_${now:%Y%m%d_%H%M%S} # 运行名称 (使用 OmegaConf 时间戳)
+seed: 42                                 # 随机种子
+run_options:                             # 运行选项 (传递给 trainer)
+  device: auto                           # 'auto', 'cuda', 'cpu'
+
+# --- 数据设置 ---
+data:
+  processed_dir: data/processed          # 处理后的数据目录 (相对路径)
+  train_split: 0.8                       # 训练集比例
+  val_split: 0.1                         # 验证集比例 (测试集比例自动计算)
+  num_workers: 0                         # DataLoader 工作进程数 (0 表示主进程)
+  normalization:                         # Min-Max 归一化设置
+    enabled: true                        # 是否启用归一化
+    compute_stats: true                  # 如果 stats_file 不存在，是否从训练集计算统计数据
+    stats_file: ${data.processed_dir}/norm_stats.json # 归一化统计数据文件路径 (使用 OmegaConf 插值)
+
+# --- 模型设置 (固定为 AdaptiveFastscapePINN) ---
+model:
+  # AdaptiveFastscapePINN 的参数
+  output_dim: 1
+  hidden_dim: 256
+  num_layers: 8                          # 坐标 MLP 部分的总层数
+  base_resolution: 64                    # CNN 处理的基础分辨率
+  max_resolution: 1024                   # 多分辨率处理的最大尺寸
+  activation_fn: Tanh                    # 激活函数 (代码中映射到 torch.nn.Tanh)
+  coordinate_input_dim: 5                # 坐标 MLP 输入维度 (x, y, t, k, u)
+  # domain_x 和 domain_y 将从 physics_params 或 data 配置中获取
+  dtype: float32                         # 模型数据类型 ('float32' 或 'float64')
+
+# --- 物理参数 (用于损失计算) ---
+physics:
+  # 这些值可能被数据加载器中的样本参数覆盖，但提供默认值
+  U: 0.0005                              # 默认抬升率 (如果数据中没有)
+  K_f: 2.0e-5                            # 默认河流侵蚀系数 K_f
+  m: 0.5                                 # 默认汇水面积指数 m
+  n: 1.0                                 # 默认坡度指数 n
+  K_d: 0.05                              # 默认坡面扩散系数 K_d
+  precip: 1.0                            # 默认降水率 (用于汇水面积计算)
+  # 物理域尺寸 (用于坐标标准化，如果模型需要)
+  domain_x: [0.0, 10000.0]               # 示例物理域 X 范围 (米)
+  domain_y: [0.0, 10000.0]               # 示例物理域 Y 范围 (米)
+  dx: ${eval:'(${physics.domain_x[1]} - ${physics.domain_x[0]}) / (${model.base_resolution} - 1)'} # 基于基础分辨率估算 dx (OmegaConf 计算)
+  dy: ${eval:'(${physics.domain_y[1]} - ${physics.domain_y[0]}) / (${model.base_resolution} - 1)'} # 基于基础分辨率估算 dy (OmegaConf 计算)
+  # 增强版汇水面积计算的参数 (可选)
+  drainage_area_kwargs:
+    initial_temp: 0.01
+    end_temp: 1e-5
+    annealing_factor: 0.98
+    max_iters: 50
+    lambda_dir: 1.0
+    convergence_threshold: 1e-5
+    special_depression_handling: true
+    flat_handling: 'uniform'
+    # stable_mode: false
+    # check_mass_conservation: false
+    # verbose: false
+
+# --- 训练设置 ---
+training:
+  max_epochs: 500                        # 总训练轮数
+  batch_size: 16                         # 每批样本数
+  optimizer: AdamW                       # 优化器类型 ('Adam', 'AdamW', 'LBFGS')
+  learning_rate: 1.0e-4                  # 初始学习率
+  weight_decay: 1.0e-5                   # 权重衰减 (L2 正则化)
+  use_mixed_precision: true              # 是否启用混合精度训练 (需要 CUDA)
+
+  # 学习率调度器
+  lr_scheduler: Cosine                   # 'Step', 'Plateau', 'Cosine', 'None'
+  lr_scheduler_config:                   # 调度器特定参数
+    # Cosine Annealing LR
+    t_max: ${training.max_epochs}        # Cosine 退火周期 (等于总轮数)
+    eta_min: 1e-7                        # 最小学习率
+    # Step LR
+    # step_size: 100
+    # gamma: 0.1
+    # ReduceLROnPlateau
+    # mode: min
+    # factor: 0.2
+    # patience: 20
+
+  # 损失权重 (固定使用双输出物理损失)
+  loss_weights:
+    data: 1.0                            # 数据损失权重
+    physics: 0.1                         # 双输出物理残差损失权重
+    smoothness: 0.001                    # 平滑度惩罚权重
+
+  # 其他训练选项
+  clip_grad_norm: 1.0                    # 梯度裁剪范数 (null 或不设置以禁用)
+  val_interval: 1                        # 每 N 轮进行一次验证
+  checkpoint_freq: 50                    # 每 N 轮保存一次检查点 (如果 save_best_only=false)
+  save_best_only: true                   # 仅保存验证损失最佳的模型
+  # load_checkpoint: null                # 可选：指定要加载的检查点路径以恢复训练
+
+# --- 日志设置 ---
+logging:
+  log_level: INFO                        # 日志级别 ('DEBUG', 'INFO', 'WARNING', 'ERROR')
+  # log_dir 和 log_filename 由脚本根据 run_name 自动设置

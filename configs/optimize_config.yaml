@@ -1,0 +1,98 @@
+# PINN_Framework/configs/optimize_config.yaml
+# 参数优化脚本 (scripts/optimize.py) 的配置文件
+
+# --- 通用运行设置 ---
+run_options:
+  output_dir: results/                     # 保存结果的基础目录
+  device: auto                           # 'auto', 'cuda', 'cpu'
+
+# --- 日志设置 ---
+logging:
+  log_level: INFO                        # 日志级别
+
+# --- 模型加载 ---
+# 指定训练好的 PINN 模型检查点
+optimization:
+  run_name: pinn_optimize_${now:%Y%m%d_%H%M%S} # 优化运行名称
+  pinn_checkpoint_path: results/<your_train_run_name>/checkpoints/best_model.pth # !!必须修改!! 指向训练好的模型
+  output_filename: optimized_params.pth    # 优化结果保存文件名
+
+  # --- 目标数据和固定输入 ---
+  target_dem_path: data/observations/target_dem.npy # !!必须修改!! 指向观测数据文件 (.npy)
+  fixed_inputs: # 提供初始状态和固定的物理参数文件路径 (可选)
+    initial_topography: data/observations/initial_topo.npy # !!必须修改!! 指向初始地形文件 (.npy)
+  fixed_parameters: # 直接指定固定的物理参数值 (如果不是从文件加载)
+    K: 1.5e-5 # 固定 K_f (河流侵蚀系数)
+    D: 0.05   # 固定 K_d (坡面扩散系数)
+    m: 0.5    # 固定 m (汇水面积指数)
+    n: 1.0    # 固定 n (坡度指数)
+    # precip: 1.0 # 如果降水率固定且非默认值 1.0
+
+  # --- 待优化参数配置 ---
+  parameters_to_optimize:
+    U: # 优化抬升率 U
+      initial_guess_type: constant # 初始猜测类型: 'constant', 'random'
+      initial_value: 0.0005       # 初始猜测值 (用于 'constant')
+      # initial_random_low: 0.0   # 随机初始化的下界 (用于 'random')
+      # initial_random_high: 0.001 # 随机初始化的上界 (用于 'random')
+      bounds: [0.0, 0.002]        # 优化边界 [min, max], 使用 null 表示无边界 (例如 [0.0, null])
+      # parameter_shape: [10, 10] # 可选：如果使用低分辨率参数化插值
+    # K: # 示例：同时优化 K_f
+    #   initial_guess_type: constant
+    #   initial_value: 2.0e-5
+    #   bounds: [1.0e-7, 1.0e-4]
+
+  # --- 目标时间 ---
+  t_target: 50000.0 # 观测数据对应的时间 (年)
+
+  # --- PyTorch 优化器参数 ---
+  optimization_params:
+    optimizer: AdamW                 # 优化器: 'Adam', 'AdamW', 'LBFGS'
+    learning_rate: 1e-4              # 学习率
+    max_iterations: 500              # 最大迭代次数
+    spatial_smoothness_weight: 1e-1  # 空间平滑度正则化权重 (惩罚拉普拉斯算子)
+    log_interval: 25                 # 每 N 次迭代记录一次日志
+    convergence_patience: 30         # 多少次迭代损失无明显改善后停止 (仅 Adam/AdamW)
+    loss_tolerance: 1e-8             # 损失变化容忍度 (仅 Adam/AdamW)
+    # AdamW 特定参数
+    weight_decay: 1e-3
+    # betas: [0.9, 0.999]
+    # eps: 1e-8
+    # LBFGS 特定参数 (如果使用 LBFGS)
+    # lbfgs_max_iter: 20
+
+# --- 模型配置 (必须与加载的检查点匹配!) ---
+# 提供加载的模型的基本信息，以便脚本可以验证或实例化（如果需要）
+model:
+  # name: AdaptiveFastscapePINN # 名称不再需要，因为脚本固定使用它
+  output_dim: 1
+  hidden_dim: 256
+  num_layers: 8
+  base_resolution: 64
+  max_resolution: 1024
+  activation_fn: Tanh
+  coordinate_input_dim: 5
+  dtype: float32
+  # domain_x 和 domain_y 通常在优化时不直接需要，除非用于插值或特定正则化
+
+# --- 物理参数 (用于目标函数内部的模型预测) ---
+# 这些参数应与训练时使用的参数一致，或者反映优化场景的假设
+physics:
+  # m, n, K_d, K_f 等如果固定，应在 optimization.fixed_parameters 中定义
+  # 如果它们是优化的，则不应在这里定义
+  precip: 1.0                            # 降水率 (如果固定)
+  # 物理域尺寸 (可能需要，取决于模型实现或正则化)
+  domain_x: [0.0, 10000.0]
+  domain_y: [0.0, 10000.0]
+  dx: ${eval:'(${physics.domain_x[1]} - ${physics.domain_x[0]}) / (${model.base_resolution} - 1)'} # 估算 dx
+  dy: ${eval:'(${physics.domain_y[1]} - ${physics.domain_y[0]}) / (${model.base_resolution} - 1)'} # 估算 dy
+  # 汇水面积参数 (应与训练时一致)
+  drainage_area_kwargs:
+    initial_temp: 0.01
+    end_temp: 1e-5
+    annealing_factor: 0.98
+    max_iters: 50
+    lambda_dir: 1.0
+    convergence_threshold: 1e-5
+    special_depression_handling: true
+    flat_handling: 'uniform'
