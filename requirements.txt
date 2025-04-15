@@ -1,13 +1,29 @@
 # PINN_Framework/requirements.txt
-# Core dependencies are managed by environment.yml (Conda)
+# 核心依赖项通过 environment.yml (Conda) 管理
+# 此文件包含额外的开发/测试依赖项，或者在某些环境中可能难以通过 Conda 安装的包
+# 使用方法: pip install -r requirements.txt
 
-# Development/Testing Dependencies (Install via pip after creating Conda env)
-pytest
-pytest-mock
-omegaconf
+# 开发和测试依赖项
+pytest>=7.0.0         # 单元测试框架
+pytest-mock>=3.10.0   # 测试模拟工具
+pytest-cov>=4.1.0     # 测试覆盖率报告
 
-# Other potential dependencies (uncomment if needed and not available via Conda)
-# scipy
-# matplotlib # For visualization
-# netcdf4 # If fastscape outputs netcdf
-# scikit-image # Potential use in data processing/analysis
+# 配置管理
+omegaconf>=2.3.0      # 高级配置系统，支持变量插值
+
+# 代码质量工具
+black                 # 代码格式化工具
+flake8                # 代码风格检查
+isort                 # import 语句排序
+
+# 文档工具
+sphinx                # 文档生成工具
+sphinx-rtd-theme      # Read the Docs 主题
+
+# 其他可能需要的依赖项（如果 Conda 安装失败，可以取消注释）
+# scipy>=1.10.0        # 科学计算库
+# matplotlib>=3.7.0    # 可视化库
+# netcdf4>=1.6.0       # NetCDF 文件处理
+# scikit-image>=0.20.0 # 图像处理库
+# pillow>=10.0.0       # 图像处理库
+# pandas>=2.0.0        # 数据分析库
