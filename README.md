@@ -2,7 +2,7 @@
 
 ## 1. 概述
 
-`PINN_Framework` 是一个基于物理信息神经网络 (Physics-Informed Neural Network, PINN) 的地貌演化模拟框架。它是从 `PINN_Fastscape_Framework` 精简而来，旨在提供一个更简洁、聚焦于单一主线实现的代码库。
+`PINN_Framework` 是一个基于物理信息神经网络 (Physics-Informed Neural Network, PINN) 的地貌演化模拟框架。
 
 该框架的核心目标是：
 
