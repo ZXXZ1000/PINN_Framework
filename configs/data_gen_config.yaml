@@ -2,123 +2,130 @@
 # 数据生成脚本 (scripts/generate_data.py) 的配置文件
 
 data_generation:
-  num_samples: 5000              # 每个分辨率要生成的样本数量
-  base_output_dir: data/processed # 保存处理后 .pt 文件的主目录 (相对路径)
+  num_samples: 10             # 每个分辨率要生成的样本数量
+  base_output_dir: data/processed10 # 保存处理后 .pt 文件的主目录 (相对路径)
+  num_workers: 10                # 新增：并行生成样本的工作进程数 (0 表示自动检测 CPU 核心数, 1 表示单进程)
+  random_seed: 42                # 新增：用于可复现性的基础随机种子 (可选, None 表示不设置)
 
   # --- 多分辨率设置 ---
-  resolutions:                  # 要生成的数据的分辨率列表 [(H1, W1), (H2, W2), ...]
+  resolutions: # Corrected indentation
+    - [32, 32]
     - [64, 64]
-    - [128, 128] # 生成更高分辨率的数据
-    - [256, 256] # 可选：生成更高分辨率的数据
+    - [128, 128]
+    - [256, 256]
+    # --- 新增矩形分辨率 ---
+    - [64, 128]   # 1:2 纵横比
+    - [128, 64]   # 2:1 纵横比
+    - [32, 96]    # 1:3 纵横比
+    - [96, 32]    # 3:1 纵横比
+    - [128, 256]  # 1:2 纵横比 (更大尺寸)
+    - [256, 128]  # 2:1 纵横比 (更大尺寸)
+    # - [512, 512]   # 可选，算力允许时加入
 
-  domain_size_x: 10000.0        # 模拟域的物理宽度 (例如，米)
-  domain_size_y: 10000.0        # 模拟域的物理高度 (例如，米)
+  domain_size_x: 100.0        # 模拟域的物理宽度 (例如，米)
+  domain_size_y: 100.0        # 模拟域的物理高度 (例如，米)
 
   # --- 参数生成设置 ---
   parameter_type: spatial       # 参数类型: 'scalar' 或 'spatial'
-                                # 'spatial' 允许 uplift_rate 和 k_f 空间变化
+                                # 'spatial' 允许 uplift_rate 和 spl__k_coef (即 k_f) 空间变化
 
   # 标量参数采样范围 (即使在 'spatial' 模式下，这些也用作空间场的基础范围或非空间参数的值)
   # 注意：键名需要匹配 fastscape/xsimlab 模型中的输入变量名
   parameter_ranges:
-    uplift__rate: [0.0001, 0.001]   # 抬升率 U (m/yr)
-    spl__k_coef: [1.0e-6, 5.0e-5]   # 河流侵蚀系数 K_f
-    diffusion__diffusivity: [0.01, 0.1] # 坡面扩散系数 K_d
-    spl__area_exp: [0.4, 0.6]       # 汇水面积指数 m (通常为标量)
-    spl__slope_exp: [1.0, 1.0]      # 坡度指数 n (通常固定为 1.0)
+    uplift__rate: [0.0005, 0.0012]   # 抬升率 U (m/yr) - 空间模式的基础范围 (保持不变)
+    spl__k_coef: [6e-6, 6e-6]   # 河流侵蚀系数 K_f - 空间模式的基础范围 (调整范围)
+    diffusion__diffusivity: [0.005, 0.05] # 坡面扩散系数 K_d (标量) (调整范围)
+    spl__area_exp: [0.43, 0.5]           # 河流侵蚀面积指数 m (通常为标量) (保持不变)
+    spl__slope_exp: [1.0, 1.0]          # 河流侵蚀坡度指数 n (通常固定或标量) (保持不变)
 
-  # 空间变化参数配置 (仅当 parameter_type: 'spatial' 时使用)
+  # --- 空间参数生成设置 (仅当 parameter_type = 'spatial' 时使用) ---
+  # 定义如何生成空间变化的参数场 (例如，抬升率 U, 侵蚀系数 K_f)
   spatial_parameter_config:
     uplift__rate:                 # 配置空间变化的抬升率 U
-      pattern: 'random'           # 模式: 'constant', 'random', 'fault'
-      min: 0.0001                 # 空间场最小值 (覆盖 parameter_ranges 中的值)
-      max: 0.001                  # 空间场最大值 (覆盖 parameter_ranges 中的值)
+      pattern: ['gradient', 'sine', 'gaussian_peak', 'composite', 'fault'] # 从列表中随机选择模式 (移除了 random, smooth_noise)
+      min: 0.0005                 # 空间场的最小值 (覆盖 parameter_ranges 中的值)
+      max: 0.0012                 # 空间场最大值 (覆盖 parameter_ranges 中的值, 略微调高上限)
+      # --- 特定模式的可选参数 (kwargs) --- (仅当选择对应 pattern 时生效)
+      # sigma: 5.0                  # 例如: 用于 'gaussian_peak'
+      # freq_x: 2.0, freq_y: 1.5    # 例如: 用于 'sine'
+      # angle: 0.785                # 例如: 用于 'gradient'
+      # --- 复合模式 ('composite') 特定参数 --- (仅当 pattern 选中 'composite' 时生效)
+      composite_config:
+        num_components: {min: 3, max: 6} # 随机组合 3 到 6 个基础模式
+        base_patterns: ['gradient', 'sine', 'gaussian_peak', 'fault'] # 复合模式的基础模式 (移除了 random, smooth_noise)
+      # --- 新增：最终平滑控制 --- (应用于生成的最终空间场)
+      smoothing:
+        apply: true                 # 是否应用高斯平滑
+        sigma: {min: 0.5, max: 1.5} # 高斯平滑的标准差范围
+
     spl__k_coef:                  # 配置空间变化的侵蚀系数 K_f
-      pattern: 'constant'         # 示例：K_f 保持常量（但仍作为空间场处理）
-      min: 2.0e-5                 # 常量值
-      max: 2.0e-5                 # 常量值
+      pattern: ['gradient', 'sine', 'gaussian_peak', 'composite', 'fault'] # 从列表中随机选择模式 (移除了 random, smooth_noise)
+      min: 6e-6                 # 空间场的最小值 (与 parameter_ranges 匹配)
+      max: 6e-6                 # 空间场最大值 (略微调高上限)
+      # --- 特定模式的可选参数 (kwargs) --- (仅当随机选中对应 pattern 时生效)
+      # sigma: 8.0                  # 例如: 用于 'gaussian_peak'
+      # angle: 1.57                 # 例如: 用于 'gradient'
+      # --- 复合模式 ('composite') 特定参数 --- (仅当 pattern 选中 'composite' 时生效)
+      composite_config:
+        num_components: {min: 3, max: 6} # 随机组合 3 到 6 个基础模式
+        base_patterns: ['gradient', 'sine', 'gaussian_peak', 'fault'] # 复合模式的基础模式 (移除了 random, smooth_noise)
+      # --- 新增：最终平滑控制 --- (应用于生成的最终空间场)
+      smoothing:
+        apply: true                 # 是否应用高斯平滑
+        sigma: {min: 0.5, max: 1.5} # 高斯平滑的标准差范围
 
-  # --- 初始地形设置 ---
+  # --- 初始地形生成设置 ---
+  # 定义如何生成模拟开始时的初始地形
   initial_topography:
-    method: 'sine_mix'           # 初始地形生成方法: 'flat', 'sine', 'sine_mix', 'smooth_noise', 'random'
-    amplitude: 10.0              # 地形振幅 (米)
-    frequency: 1.5               # 空间频率 (对于正弦波方法)
-    seed: 42                     # 随机种子 (对于随机方法，设为null则每次生成不同地形)
+    method: 'composite'           # 当前选择：使用复合方法
+    amplitude: {min: 10.0, max: 50.0} # 地形特征的基础振幅/高度范围 (m) (改为范围)
+    # --- 特定方法的可选参数 (kwargs) --- (仅当选择对应 method 时生效)
+    # frequency: 3.0              # 例如: 用于 'sine', 'sine_mix'
+    # sigma: 10.0                 # 例如: 用于 'smooth_noise', 'gaussian_hill'
+    # --- 分形噪声参数 (需要 'noise' 库, 仅当选择 'fractal' method 时生效) ---
+    # scale: 50.0
+    # octaves: 6
+    # persistence: 0.5
+    # lacunarity: 2.0
+    # --- 其他特定方法参数示例 ---
+    # smoothness: 3.0             # 例如: 用于 'plateau' (高斯滤波 sigma)
+    # valley_width: 15.0          # 例如: 用于 'valley'
+    # --- 复合地形 ('composite') 特定参数 ---
+    composite_config:
+      num_components: {min: 4, max: 7} # 指定随机组合多少个基础地形特征 (调整范围)
+      base_methods: ['flat', 'sine', 'smooth_noise', 'gaussian_hill', 'fractal', 'plateau', 'valley'] # 基础特征 (移除了 random)
+    # --- 新增：最终平滑控制 --- (取代 final_smoothness)
+    smoothing:
+      apply: true                 # 是否应用高斯平滑
+      sigma: {min: 0.5, max: 2.0} # 高斯平滑的标准差范围
 
-  # --- 模拟参数 ---
+  # --- 模拟参数 (传递给 xsimlab/fastscape) ---
   simulation_params:
-    run_time: 50000.0             # 总模拟时间 (例如，年)
-    time_step: 500.0              # fastscape 内部时间步长 (影响稳定性)
-    boundary__status: 'fixed_value' # 边界条件类型 (例如, 'fixed_value', 'closed')
-    # grid_shape 和 grid_length 由 resolutions 和 domain_size_* 自动处理
+    # grid__shape 和 grid__length 会被 resolutions 和 domain_size 覆盖
+    boundary__status: 'fixed_value' # 边界条件类型 ('fixed_value', 'closed', 'looped') (保持不变)
+    # --- 时间设置 ---
+    run_time: 5000000.0             # 总模拟时长 (单位与参数一致，例如年) (保持不变)
+    time_step: 100.0              # 内部模拟时间步长 (影响稳定性) (保持不变)
+    output_interval: 50000.0       # 保存快照的时间间隔 (可选, 如果需要中间状态) (保持不变)
 
-# --- 日志配置 (可选) ---
-# logging:
-#   log_dir: logs/data_generation
-#   log_filename: generate_data.log
-#   log_level: INFO
+  # --- 数据保存设置 ---
+  save_format: 'pt'             # 保存格式 ('pt' for PyTorch tensors)
+  save_fields:
+    # 定义要从模拟结果和输入中保存哪些字段
+    # 键是保存文件中的名称，值是提取逻辑或 xarray 变量名
+    initial_topo: 'initial_topo_tensor' # 从我们生成的 tensor 保存
+    final_topo: 'topography__elevation' # 从 xarray 输出中提取最后一个时间步
+    uplift_rate: 'uplift__rate'         # 从输入参数中保存 (可能是标量或数组)
+    k_f: 'spl__k_coef'                  # 从输入参数中保存 (可能是标量或数组)
+    k_d: 'diffusion__diffusivity'       # 从输入参数中保存 (标量)
+    m: 'spl__area_exp'                  # 从输入参数中保存 (标量)
+    n: 'spl__slope_exp'                 # 从输入参数中保存 (标量)
+    run_time: 'run_time_total'          # 保存实际运行总时长
+    grid_shape: 'grid_shape'            # 保存网格形状
+    domain_size: ['domain_size_x', 'domain_size_y'] # 保存物理域尺寸
 
-# --- 运行选项 (可选, 如果 train.py/optimize.py 需要) ---
-# run_options:
-#   output_dir: results/ # 训练/优化结果的基础目录
-#   device: auto         # 'auto', 'cuda', 'cpu'
-
-# --- 模型配置 (示例, 主要用于 train.py/optimize.py) ---
-# model:
-#   name: AdaptiveFastscapePINN # 固定的模型名称
-#   output_dim: 1
-#   hidden_dim: 256
-#   num_layers: 8
-#   base_resolution: 64
-#   max_resolution: 1024
-#   activation_fn: Tanh # 需要在代码中映射到 torch.nn.Tanh
-#   coordinate_input_dim: 5
-#   dtype: float32
-
-# --- 训练配置 (示例, 用于 train.py) ---
-# training:
-#   batch_size: 16
-#   max_epochs: 500
-#   learning_rate: 1e-4
-#   optimizer: AdamW
-#   weight_decay: 1e-5
-#   lr_scheduler: Cosine
-#   lr_scheduler_config:
-#     t_max: ${training.max_epochs} # 使用 OmegaConf 插值
-#     eta_min: 1e-7
-#   loss_weights:
-#     data: 1.0
-#     physics: 0.1
-#     smoothness: 0.001
-#   seed: 42
-#   use_mixed_precision: True
-#   checkpoint_freq: 50
-#   save_best_only: True
-#   run_name: pinn_train_run_${now:%Y%m%d_%H%M%S} # 使用 OmegaConf 时间戳
-
-# --- 优化配置 (示例, 用于 optimize.py) ---
-# optimization:
-#   run_name: pinn_optimize_run_${now:%Y%m%d_%H%M%S}
-#   pinn_checkpoint_path: results/pinn_train_run_.../checkpoints/best_model.pth # 需要指定训练好的模型
-#   target_dem_path: data/observations/target_dem.npy # 需要提供观测数据
-#   fixed_inputs: # 提供初始状态和固定的物理参数
-#     initial_topography: data/observations/initial_topo.npy
-#   fixed_parameters:
-#     K: 1.5e-5 # 固定 K_f
-#     D: 0.05   # 固定 K_d
-#     m: 0.5
-#     n: 1.0
-#   parameters_to_optimize: # 配置要优化的参数
-#     U: # 优化抬升率 U
-#       initial_guess_type: constant # 'constant', 'random'
-#       initial_value: 0.0005       # 初始猜测值
-#       bounds: [0.0, 0.002]        # 优化边界 [min, max]
-#       # parameter_shape: [10, 10] # 可选：如果使用低分辨率参数化
-#   t_target: 50000.0 # 观测数据对应的时间
-#   optimization_params: # PyTorch 优化器参数
-#     optimizer: AdamW
-#     learning_rate: 1e-4
-#     max_iterations: 500
-#     spatial_smoothness_weight: 1e-1 # 正则化权重
-#     log_interval: 20
-#     output_filename: optimized_U.pth # 输出文件名
+# --- 日志设置 ---
+logging:
+  level: INFO                   # 日志级别 (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+  # log_file: logs/data_generation.log # 日志文件路径 (可选, 默认输出到控制台)
+  log_format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
