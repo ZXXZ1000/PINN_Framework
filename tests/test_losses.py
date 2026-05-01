@@ -10,8 +10,10 @@ from unittest.mock import patch, MagicMock
 from src import losses
 from src.losses import (
     compute_data_loss,
+    compute_increment_loss,
     compute_pde_residual_dual_output,
     compute_smoothness_penalty,
+    compute_temporal_derivative_loss,
     compute_total_loss
 )
 
@@ -64,6 +66,8 @@ def sample_loss_weights():
     """创建一个样本损失权重字典。"""
     return {
         'data': 1.0,
+        'increment': 0.25,
+        'derivative_data': 0.1,
         'physics': 0.5,
         'smoothness': 0.1
     }
@@ -107,6 +111,29 @@ def test_compute_data_loss_no_grad(sample_prediction, sample_target):
     loss = compute_data_loss(pred_no_grad, sample_target)
     assert not loss.requires_grad
 
+
+def test_compute_increment_loss(sample_prediction):
+    """测试 Δh 增量损失。"""
+    initial = torch.ones_like(sample_prediction)
+    target = initial + 2.0
+    predicted = initial + 1.5
+
+    loss = compute_increment_loss(predicted, target, initial)
+
+    assert torch.isclose(loss, torch.tensor(0.25))
+
+
+def test_compute_temporal_derivative_loss(sample_prediction):
+    """测试 dh/dt 监督损失使用有限差分目标。"""
+    initial = torch.zeros_like(sample_prediction)
+    target = torch.ones_like(sample_prediction) * 4.0
+    dt = torch.full((sample_prediction.shape[0],), 2.0)
+    predicted_derivative = torch.ones_like(sample_prediction) * 1.5
+
+    loss = compute_temporal_derivative_loss(predicted_derivative, initial, target, dt)
+
+    assert torch.isclose(loss, torch.tensor(0.25))
+
 # --- 测试 compute_pde_residual_dual_output ---
 
 @patch('src.losses.calculate_dhdt_physics')
@@ -125,7 +152,8 @@ def test_compute_pde_residual_success(mock_calc_dhdt, sample_model_outputs, samp
     call_args, call_kwargs = mock_calc_dhdt.call_args
     assert torch.equal(call_kwargs['h'], h_pred)
     assert call_kwargs['K_f'].shape == h_pred.shape # Check broadcasting
-    assert call_kwargs['m'] == sample_physics_params['m']
+    assert call_kwargs['m'].shape == h_pred.shape
+    assert call_kwargs['n'].shape == h_pred.shape
     assert call_kwargs['da_params'] == sample_physics_params['da_params']
 
     # Calculate expected residual loss
@@ -141,12 +169,10 @@ def test_compute_pde_residual_success(mock_calc_dhdt, sample_model_outputs, samp
 def test_compute_pde_residual_physics_error(mock_calc_dhdt, sample_model_outputs, sample_physics_params, caplog):
     """测试 PDE 残差计算在物理计算失败时的错误处理。"""
     with caplog.at_level(logging.ERROR):
-        loss = compute_pde_residual_dual_output(sample_model_outputs, sample_physics_params)
+        with pytest.raises(RuntimeError, match="Failed to compute dual-output PDE residual"):
+            compute_pde_residual_dual_output(sample_model_outputs, sample_physics_params)
 
     assert "计算双输出 PDE 残差时出错: Physics failed" in caplog.text
-    # Should return zero loss with gradient connection
-    assert torch.isclose(loss, torch.tensor(0.0))
-    assert loss.requires_grad
 
 def test_compute_pde_residual_missing_keys(sample_model_outputs, sample_physics_params):
     """测试 PDE 残差计算在缺少 state 或 derivative 键时引发 ValueError。"""
@@ -215,9 +241,12 @@ def test_compute_smoothness_penalty_invalid_shape(sample_physics_params, caplog)
 
 # --- 测试 compute_total_loss ---
 
-@patch('src.losses.compute_data_loss', return_value=torch.tensor(1.5, requires_grad=True))
+@patch('src.losses.compute_temporal_derivative_loss', return_value=torch.tensor(0.25, requires_grad=True))
+@patch('src.losses.compute_increment_loss', return_value=torch.tensor(2.0, requires_grad=True))
 @patch('src.losses.compute_smoothness_penalty', return_value=torch.tensor(0.5, requires_grad=True))
-def test_compute_total_loss_all_components(mock_smoothness, mock_data, sample_prediction, sample_target, sample_physics_params, sample_loss_weights):
+@patch('src.losses.compute_data_loss', return_value=torch.tensor(1.5, requires_grad=True))
+def test_compute_total_loss_all_components(mock_data, mock_smoothness, mock_increment, mock_derivative,
+                                           sample_prediction, sample_target, sample_physics_params, sample_loss_weights):
     """测试总损失计算（所有组件）。"""
     physics_loss_val = torch.tensor(1.0, requires_grad=True) # Precomputed physics loss
     smoothness_pred = sample_prediction # Use same pred for smoothness
@@ -228,13 +257,20 @@ def test_compute_total_loss_all_components(mock_smoothness, mock_data, sample_pr
         physics_loss_value=physics_loss_val,
         smoothness_pred=smoothness_pred,
         physics_params=sample_physics_params,
-        loss_weights=sample_loss_weights
+        loss_weights=sample_loss_weights,
+        initial_topo=torch.zeros_like(sample_prediction),
+        derivative_pred=torch.ones_like(sample_prediction),
+        dt=torch.ones(sample_prediction.shape[0]),
     )
 
     mock_data.assert_called_once_with(sample_prediction, sample_target)
     mock_smoothness.assert_called_once_with(smoothness_pred, sample_physics_params['dx'], sample_physics_params['dy'])
+    mock_increment.assert_called_once()
+    mock_derivative.assert_called_once()
 
     expected_total = (sample_loss_weights['data'] * 1.5 +
+                      sample_loss_weights['increment'] * 2.0 +
+                      sample_loss_weights['derivative_data'] * 0.25 +
                       sample_loss_weights['physics'] * 1.0 +
                       sample_loss_weights['smoothness'] * 0.5)
 
@@ -245,6 +281,8 @@ def test_compute_total_loss_all_components(mock_smoothness, mock_data, sample_pr
 
     assert isinstance(loss_dict, dict)
     assert loss_dict['data_loss'] == pytest.approx(sample_loss_weights['data'] * 1.5)
+    assert loss_dict['increment_loss'] == pytest.approx(sample_loss_weights['increment'] * 2.0)
+    assert loss_dict['derivative_data_loss'] == pytest.approx(sample_loss_weights['derivative_data'] * 0.25)
     assert loss_dict['physics_loss'] == pytest.approx(sample_loss_weights['physics'] * 1.0)
     assert loss_dict['smoothness_loss'] == pytest.approx(sample_loss_weights['smoothness'] * 0.5)
     assert loss_dict['total_loss'] == pytest.approx(expected_total)
@@ -256,6 +294,8 @@ def test_compute_total_loss_partial_components(mock_smoothness, mock_data, sampl
     # Disable physics loss (weight=0) and smoothness loss (input=None)
     partial_weights = sample_loss_weights.copy()
     partial_weights['physics'] = 0.0
+    partial_weights['increment'] = 0.0
+    partial_weights['derivative_data'] = 0.0
     mock_data.return_value = torch.tensor(1.5, requires_grad=True)
 
     total_loss, loss_dict = compute_total_loss(

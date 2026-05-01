@@ -2,6 +2,7 @@
 import sys
 import os
 import pytest
+from unittest.mock import patch
 
 # 将项目根目录 (PINN_Framework) 添加到 sys.path
 # conftest.py 位于 tests 目录下，其父目录是 PINN_Framework
@@ -16,3 +17,21 @@ if project_root not in sys.path:
 #     print("Setting up common resource")
 #     yield "resource_data"
 #     print("Tearing down common resource")
+
+
+@pytest.fixture
+def mocker():
+    """Small pytest-mock compatible fixture for the patch API used in this suite."""
+    active_patchers = []
+
+    class Mocker:
+        def patch(self, *args, **kwargs):
+            patcher = patch(*args, **kwargs)
+            mocked = patcher.start()
+            active_patchers.append(patcher)
+            return mocked
+
+    yield Mocker()
+
+    for patcher in reversed(active_patchers):
+        patcher.stop()

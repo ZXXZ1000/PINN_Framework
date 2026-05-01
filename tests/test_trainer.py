@@ -182,8 +182,32 @@ def test_trainer_initialization(mock_get_device, mock_summary_writer, mock_model
 def test_trainer_initialization_wrong_model_type(base_config, mock_train_loader, mock_val_loader):
     """测试使用错误模型类型初始化 Trainer 时引发 TypeError。"""
     wrong_model = nn.Linear(10, 1) # Not a TimeDerivativePINN
-    with pytest.raises(TypeError, match="Model must be an instance of AdaptiveFastscapePINN or TimeDerivativePINN"):
+    with pytest.raises(TypeError, match="Model must be an instance of TimeDerivativePINN"):
         PINNTrainer(wrong_model, base_config, mock_train_loader, mock_val_loader)
+
+@patch('src.trainer.SummaryWriter')
+@patch('src.trainer.get_device', return_value=torch.device('cpu'))
+def test_build_physics_params_for_loss_uses_batch_values(mock_get_device, mock_summary_writer, mock_model, base_config, mock_train_loader):
+    """测试 physics residual 使用 batch 参数而不是只用全局 physics 配置。"""
+    trainer_instance = PINNTrainer(mock_model, base_config, mock_train_loader, None)
+    params_dict = {
+        'K': torch.tensor([1e-5, 2e-5]),
+        'D': torch.tensor([0.01, 0.02]),
+        'U': torch.tensor([1e-4, 2e-4]),
+        'm': torch.tensor([0.45, 0.55]),
+        'n': torch.tensor([0.9, 1.1]),
+        'precip': torch.tensor([1.0, 1.2]),
+    }
+
+    physics_params = trainer_instance._build_physics_params_for_loss(params_dict)
+
+    assert physics_params['K_f'] is params_dict['K']
+    assert physics_params['K_d'] is params_dict['D']
+    assert physics_params['U'] is params_dict['U']
+    assert physics_params['m'] is params_dict['m']
+    assert physics_params['n'] is params_dict['n']
+    assert physics_params['precip'] is params_dict['precip']
+    assert physics_params['da_params'] == base_config['physics']['drainage_area_kwargs']
 
 # --- 测试优化器和调度器设置 ---
 

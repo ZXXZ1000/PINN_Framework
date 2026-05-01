@@ -289,6 +289,26 @@ def test_save_and_load_config_omegaconf(temp_config_file):
     # 比较加载的字典（已解析）和原始 conf 解析后的容器
     assert loaded_conf == OmegaConf.to_container(conf, resolve=True)
 
+def test_normalize_training_config_legacy_root_fields():
+    """测试旧版顶层运行配置会归一化到 training 配置。"""
+    config = {
+        'output_dir': 'results_root',
+        'run_name': 'root_run',
+        'seed': 7,
+        'run_options': {'device': 'cpu'},
+        'training': {'checkpoint_freq': 3}
+    }
+
+    normalized = utils.normalize_training_config(config)
+    training = normalized['training']
+
+    assert training['results_dir'] == 'results_root'
+    assert training['run_name'] == 'root_run'
+    assert training['seed'] == 7
+    assert training['device'] == 'cpu'
+    assert training['save_interval'] == 3
+    assert config['training'] == {'checkpoint_freq': 3} # 原始配置不被原地修改
+
 
 def test_load_config_not_found(caplog):
     """测试 load_config 在文件不存在时引发 FileNotFoundError 并记录错误。"""

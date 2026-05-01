@@ -12,7 +12,10 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import random
-from typing import List, Dict, Optional, Callable, Any
+from typing import List, Dict, Optional, Callable, Any, Tuple
+
+TRAJECTORY_TOPO_KEYS = ('trajectory_topo', 'topography', 'topography__elevation', 'h')
+TRAJECTORY_TIME_KEYS = ('time', 'times', 'out')
 
 # --- Fastscape Dataset Class ---
 
@@ -64,6 +67,26 @@ class FastscapeDataset(Dataset):
             return torch.tensor(float(value), dtype=torch.float32)
         else:
             raise TypeError(f"Unsupported type for parameter conversion: {type(value)}")
+
+    def _find_trajectory_key(self, sample_data: Dict[str, Any]) -> Optional[str]:
+        """Returns the first recognized trajectory key with at least two time slices."""
+        for key in TRAJECTORY_TOPO_KEYS:
+            if key not in sample_data:
+                continue
+            try:
+                tensor = self._to_float_tensor(sample_data[key])
+            except (TypeError, ValueError):
+                continue
+            if tensor.ndim >= 3 and tensor.shape[0] >= 2:
+                return key
+        return None
+
+    def _add_canonical_step_fields(self, processed_sample: Dict[str, Any]) -> None:
+        """Adds v1 state-transition aliases without removing legacy fields."""
+        processed_sample['state_t'] = processed_sample['initial_topo']
+        processed_sample['state_next'] = processed_sample['final_topo']
+        if 'dt' not in processed_sample:
+            processed_sample['dt'] = processed_sample['run_time']
 
     def _normalize_field(self, tensor: torch.Tensor, field_key: str) -> torch.Tensor:
         """
@@ -171,6 +194,7 @@ class FastscapeDataset(Dataset):
 
             # --- Add target shape (useful for some models/losses) ---
             processed_sample['target_shape'] = processed_sample['final_topo'].shape
+            self._add_canonical_step_fields(processed_sample)
 
             # --- Apply other transforms ---
             if self.transform:
@@ -233,6 +257,132 @@ class FastscapeDataset(Dataset):
         except Exception as e:
             logging.warning(f"Error during denormalization: {e}")
             return normalized_state_tensor
+
+
+class TrajectoryFastscapeDataset(FastscapeDataset):
+    """
+    Dataset that exposes trajectory files as one-step transition samples.
+
+    Supported trajectory fields:
+      - trajectory_topo, topography, topography__elevation, or h with shape
+        [T, H, W] or [T, 1, H, W].
+      - optional time/times/out vector with shape [T].
+
+    Legacy pair samples are still accepted as a single transition.
+    """
+    def __init__(self,
+                 file_list: List[str],
+                 normalize: bool = False,
+                 norm_stats: Optional[Dict[str, Dict[str, float]]] = None,
+                 transform: Optional[Callable] = None):
+        super().__init__(file_list, normalize=normalize, norm_stats=norm_stats, transform=transform)
+        self.index: List[Tuple[str, Optional[int]]] = []
+        self._build_index()
+
+    def _build_index(self) -> None:
+        for filepath in self.file_list:
+            try:
+                sample_data = torch.load(filepath, map_location=torch.device('cpu'), weights_only=False)
+                trajectory_key = self._find_trajectory_key(sample_data)
+                if trajectory_key:
+                    trajectory = self._to_float_tensor(sample_data[trajectory_key])
+                    for step_idx in range(int(trajectory.shape[0]) - 1):
+                        self.index.append((filepath, step_idx))
+                else:
+                    self.index.append((filepath, None))
+            except Exception as e:
+                logging.warning(f"Skipping file during trajectory index build: {filepath}. Error: {e}")
+
+        if not self.index:
+            logging.warning("TrajectoryFastscapeDataset initialized with an empty transition index.")
+        else:
+            logging.info(f"TrajectoryFastscapeDataset indexed {len(self.index)} transitions from {len(self.file_list)} files.")
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def _extract_time_vector(self, sample_data: Dict[str, Any]) -> Optional[torch.Tensor]:
+        for key in TRAJECTORY_TIME_KEYS:
+            if key in sample_data:
+                try:
+                    return self._to_float_tensor(sample_data[key]).flatten()
+                except (TypeError, ValueError):
+                    logging.warning(f"Could not parse trajectory time field '{key}'.")
+        return None
+
+    def _select_transition_dt(self, sample_data: Dict[str, Any], step_idx: int, num_steps: int) -> torch.Tensor:
+        time_vector = self._extract_time_vector(sample_data)
+        if time_vector is not None and time_vector.numel() >= step_idx + 2:
+            return (time_vector[step_idx + 1] - time_vector[step_idx]).float()
+        if 'dt' in sample_data:
+            return self._to_float_tensor(sample_data['dt'])
+        if 'run_time' in sample_data:
+            run_time = self._to_float_tensor(sample_data['run_time'])
+            return run_time / max(num_steps - 1, 1)
+        return torch.tensor(1.0, dtype=torch.float32)
+
+    def __getitem__(self, idx: int) -> Optional[Dict[str, Any]]:
+        filepath, step_idx = self.index[idx]
+        if step_idx is None:
+            return super().__getitem__(self.file_list.index(filepath))
+
+        try:
+            sample_data = torch.load(filepath, map_location=torch.device('cpu'), weights_only=False)
+            trajectory_key = self._find_trajectory_key(sample_data)
+            if not trajectory_key:
+                logging.warning(f"Trajectory index expected trajectory data but none found in {filepath}")
+                return None
+
+            trajectory = self._to_float_tensor(sample_data[trajectory_key])
+            if trajectory.ndim == 3:
+                transition_initial = trajectory[step_idx].unsqueeze(0)
+                transition_final = trajectory[step_idx + 1].unsqueeze(0)
+            elif trajectory.ndim == 4:
+                transition_initial = trajectory[step_idx]
+                transition_final = trajectory[step_idx + 1]
+            else:
+                logging.warning(f"Unsupported trajectory shape {trajectory.shape} in {filepath}")
+                return None
+
+            required_param_keys = ['uplift_rate', 'k_f', 'k_d', 'm', 'n']
+            missing_keys = [key for key in required_param_keys if key not in sample_data]
+            if missing_keys:
+                logging.warning(f"Missing required trajectory parameter fields {missing_keys} in {filepath}")
+                return None
+
+            processed_sample = {
+                'initial_topo': transition_initial,
+                'final_topo': transition_final,
+                'run_time': self._select_transition_dt(sample_data, step_idx, int(trajectory.shape[0])),
+                'dt': self._select_transition_dt(sample_data, step_idx, int(trajectory.shape[0])),
+                'time_index': torch.tensor(step_idx, dtype=torch.long),
+            }
+
+            for key in required_param_keys:
+                processed_sample[key] = self._to_float_tensor(sample_data[key])
+
+            if self.normalize:
+                fields_to_normalize = {
+                    'initial_topo': 'topo',
+                    'final_topo': 'topo',
+                    'uplift_rate': 'uplift_rate',
+                    'k_f': 'k_f',
+                    'k_d': 'k_d',
+                }
+                for field, stats_key in fields_to_normalize.items():
+                    processed_sample[field] = self._normalize_field(processed_sample[field], stats_key)
+
+            processed_sample['target_shape'] = processed_sample['final_topo'].shape
+            self._add_canonical_step_fields(processed_sample)
+
+            if self.transform:
+                processed_sample = self.transform(processed_sample)
+
+            return processed_sample
+
+        except Exception as e:
+            logging.error(f"Error loading/processing trajectory transition {idx} from {filepath}: {e}", exc_info=True)
+            return None
 
 # --- Utility Function to Create DataLoaders ---
 
@@ -382,6 +532,10 @@ def compute_normalization_stats(train_files: List[str], fields_for_stats: List[s
             if 'topo' in fields_for_stats:
                 if 'initial_topo' in data: _update_stats(data['initial_topo'], 'topo')
                 if 'final_topo' in data: _update_stats(data['final_topo'], 'topo')
+                for trajectory_key in TRAJECTORY_TOPO_KEYS:
+                    if trajectory_key in data:
+                        _update_stats(data[trajectory_key], 'topo')
+                        break
             if 'uplift_rate' in fields_for_stats and 'uplift_rate' in data:
                 _update_stats(data['uplift_rate'], 'uplift_rate')
             if 'k_f' in fields_for_stats and 'k_f' in data:
@@ -451,6 +605,7 @@ def create_dataloaders(config: Dict) -> Dict[str, DataLoader]:
     data_dir = data_config.get('processed_dir', 'data/processed')
     batch_size = train_config.get('batch_size', 32)
     num_workers = data_config.get('num_workers', 0)
+    pin_memory = data_config.get('pin_memory', torch.cuda.is_available())
     train_split = data_config.get('train_split', 0.8)
     val_split = data_config.get('val_split', 0.1)
     if train_split + val_split > 1.0:
@@ -458,7 +613,7 @@ def create_dataloaders(config: Dict) -> Dict[str, DataLoader]:
     test_split = 1.0 - train_split - val_split
 
     logging.info(f"Creating dataloaders from: {data_dir}")
-    logging.info(f"Batch size: {batch_size}, Num workers: {num_workers}")
+    logging.info(f"Batch size: {batch_size}, Num workers: {num_workers}, Pin memory: {pin_memory}")
     logging.info(f"Splits: Train={train_split:.2f}, Val={val_split:.2f}, Test={test_split:.2f}")
 
     # --- Find data files ---
@@ -540,24 +695,31 @@ def create_dataloaders(config: Dict) -> Dict[str, DataLoader]:
         logging.info("Normalization is disabled in the configuration.")
 
     # --- Create Datasets and DataLoaders ---
-    train_dataset = FastscapeDataset(train_files, normalize=normalize_data, norm_stats=norm_stats)
-    val_dataset = FastscapeDataset(val_files, normalize=normalize_data, norm_stats=norm_stats)
-    test_dataset = FastscapeDataset(test_files, normalize=normalize_data, norm_stats=norm_stats)
+    dataset_mode = data_config.get('sample_mode', data_config.get('dataset_mode', 'pair')).lower()
+    dataset_cls = TrajectoryFastscapeDataset if dataset_mode == 'trajectory' else FastscapeDataset
+    if dataset_mode not in {'pair', 'trajectory'}:
+        logging.warning(f"Unknown dataset sample mode '{dataset_mode}'. Falling back to pair mode.")
+        dataset_cls = FastscapeDataset
+
+    logging.info(f"Dataset sample mode: {'trajectory' if dataset_cls is TrajectoryFastscapeDataset else 'pair'}")
+    train_dataset = dataset_cls(train_files, normalize=normalize_data, norm_stats=norm_stats)
+    val_dataset = dataset_cls(val_files, normalize=normalize_data, norm_stats=norm_stats)
+    test_dataset = dataset_cls(test_files, normalize=normalize_data, norm_stats=norm_stats)
 
     # Use persistent_workers only if num_workers > 0
     persist_workers = num_workers > 0
 
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-        pin_memory=True, collate_fn=collate_fn_filter_none, persistent_workers=persist_workers
+        pin_memory=pin_memory, collate_fn=collate_fn_filter_none, persistent_workers=persist_workers
     )
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
-        pin_memory=True, collate_fn=collate_fn_filter_none, persistent_workers=persist_workers
+        pin_memory=pin_memory, collate_fn=collate_fn_filter_none, persistent_workers=persist_workers
     )
     test_loader = DataLoader(
         test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,
-        pin_memory=True, collate_fn=collate_fn_filter_none, persistent_workers=persist_workers
+        pin_memory=pin_memory, collate_fn=collate_fn_filter_none, persistent_workers=persist_workers
     )
 
     # Return loaders and the norm_stats used (or None)

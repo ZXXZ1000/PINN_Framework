@@ -10,6 +10,7 @@ pytest-cov>=4.1.0     # 测试覆盖率报告
 
 # 配置管理
 omegaconf>=2.3.0      # 高级配置系统，支持变量插值
+dask[distributed]>=2024.0.0  # xsimlab/Fastscape 数据生成入口需要
 
 # 代码质量工具
 black                 # 代码格式化工具

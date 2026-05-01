@@ -1,0 +1,86 @@
+# PINN_Framework/configs/train_operator_config.yaml
+# V2 operator training config for the current Fastscape-style PDE constraint.
+
+output_dir: results/
+run_name: landscape_neural_operator_${now:%Y%m%d_%H%M%S}
+seed: 42
+run_options:
+  device: auto
+
+data:
+  processed_dir: data/processed
+  sample_mode: trajectory
+  train_split: 0.8
+  val_split: 0.1
+  num_workers: 0
+  normalization:
+    enabled: true
+    compute_stats: true
+    stats_file: ${data.processed_dir}/norm_stats.json
+
+model:
+  name: LandscapeNeuralOperator
+  output_dim: 1
+  input_channels: 10
+  hidden_channels: 32
+  channel_multipliers: [1, 2, 4]
+  activation_fn: GELU
+  predict_residual: true
+  fno_modes: [12, 12]
+  fno_layers: 2
+  use_flow_graph: true
+  flow_graph_hidden_channels: 16
+  flow_graph_iters: 32
+  flow_graph_temperature: 0.05
+  flow_graph_slope_power: 1.0
+  flow_graph_leak_rate: 0.001
+  flow_graph_positive_fn: relu
+  domain_x: ${physics.domain_x}
+  domain_y: ${physics.domain_y}
+  dtype: float32
+
+physics:
+  U: 0.0005
+  K_f: 2.0e-5
+  m: 0.5
+  n: 1.0
+  K_d: 0.05
+  precip: 1.0
+  domain_x: [0.0, 10000.0]
+  domain_y: [0.0, 10000.0]
+  dx: 158.73015873015873
+  dy: 158.73015873015873
+  drainage_area_kwargs:
+    method: soft_mfd
+    num_iters: 64
+    temperature: 0.05
+    slope_power: 1.0
+    leak_rate: 0.001
+    positive_fn: relu
+    eps: 1e-10
+    verbose: false
+
+training:
+  max_epochs: 100
+  batch_size: 8
+  optimizer: AdamW
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-5
+  use_mixed_precision: true
+  lr_scheduler: Cosine
+  lr_scheduler_config:
+    t_max: ${training.max_epochs}
+    eta_min: 1e-7
+  loss_weights:
+    data: 1.0
+    increment: 0.5
+    derivative_data: 0.1
+    physics: 0.1
+    smoothness: 0.001
+  clip_grad_norm: 1.0
+  val_interval: 1
+  checkpoint_freq: 10
+  save_best_only: true
+
+logging:
+  log_level: INFO

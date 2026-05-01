@@ -36,6 +36,80 @@ def compute_data_loss(predicted_topo: torch.Tensor, target_topo: torch.Tensor) -
     # 确保 target_topo 也是 float 类型以用于 mse_loss
     return F.mse_loss(predicted_topo, target_topo.float())
 
+
+def _as_4d_topography(tensor: torch.Tensor) -> torch.Tensor:
+    """Converts topography tensors to [B, C, H, W] for transition losses."""
+    if tensor.ndim == 2:
+        return tensor.unsqueeze(0).unsqueeze(0)
+    if tensor.ndim == 3:
+        return tensor.unsqueeze(1)
+    return tensor
+
+
+def _match_spatial_shape(tensor: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    """Matches tensor rank/spatial size to a reference topography tensor."""
+    tensor = _as_4d_topography(tensor.float())
+    reference = _as_4d_topography(reference)
+    if tensor.shape[-2:] != reference.shape[-2:]:
+        tensor = F.interpolate(tensor, size=reference.shape[-2:], mode='bilinear', align_corners=False)
+    if tensor.shape[0] != reference.shape[0] and tensor.shape[0] == 1:
+        tensor = tensor.expand(reference.shape[0], -1, -1, -1)
+    if tensor.shape[1] != reference.shape[1]:
+        tensor = tensor.mean(dim=1, keepdim=True).expand(-1, reference.shape[1], -1, -1)
+    return tensor
+
+
+def _broadcast_dt(dt: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    """Broadcasts scalar or per-sample dt values to [B, C, H, W]."""
+    if not isinstance(dt, torch.Tensor):
+        dt = torch.tensor(float(dt), device=reference.device, dtype=reference.dtype)
+    dt = dt.to(device=reference.device, dtype=reference.dtype)
+    if dt.numel() == 1:
+        return dt.view(1, 1, 1, 1).expand_as(reference)
+    if dt.ndim == 1 and dt.shape[0] == reference.shape[0]:
+        return dt.view(-1, 1, 1, 1).expand_as(reference)
+    try:
+        return dt.expand_as(reference)
+    except RuntimeError as exc:
+        raise ValueError(f"无法广播 dt 形状 {dt.shape} 到目标 {reference.shape}") from exc
+
+
+def compute_increment_loss(
+    predicted_topo: torch.Tensor,
+    target_topo: torch.Tensor,
+    initial_topo: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Matches the predicted elevation change rather than only absolute elevation.
+
+    This is the first operator-style training target:
+    (h_pred_next - h_t) should match (h_target_next - h_t).
+    """
+    predicted_topo = _as_4d_topography(predicted_topo)
+    target_topo = _match_spatial_shape(target_topo, predicted_topo)
+    initial_topo = _match_spatial_shape(initial_topo, predicted_topo)
+    pred_delta = predicted_topo - initial_topo
+    target_delta = target_topo - initial_topo
+    return F.mse_loss(pred_delta, target_delta)
+
+
+def compute_temporal_derivative_loss(
+    predicted_derivative: torch.Tensor,
+    initial_topo: torch.Tensor,
+    target_topo: torch.Tensor,
+    dt: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Supervises the model's dh/dt head using finite differences from step data.
+    """
+    predicted_derivative = _as_4d_topography(predicted_derivative)
+    target_topo = _match_spatial_shape(target_topo, predicted_derivative)
+    initial_topo = _match_spatial_shape(initial_topo, predicted_derivative)
+    dt_grid = torch.clamp(_broadcast_dt(dt, predicted_derivative), min=eps)
+    finite_difference_derivative = (target_topo - initial_topo) / dt_grid
+    return F.mse_loss(predicted_derivative, finite_difference_derivative)
+
 # --- PDE Residual Calculation (Dual Output Model) ---
 
 def compute_pde_residual_dual_output(outputs: Dict[str, torch.Tensor], physics_params: Dict) -> torch.Tensor:
@@ -98,13 +172,15 @@ def compute_pde_residual_dual_output(outputs: Dict[str, torch.Tensor], physics_p
         U_grid = prepare_param(U, target_shape, device, dtype)
         K_f_val = prepare_param(K_f, target_shape, device, dtype) # 处理可能的空间 K_f
         K_d_val = prepare_param(K_d, target_shape, device, dtype) # 处理可能的空间 K_d
+        m_val = prepare_param(m, target_shape, device, dtype)
+        n_val = prepare_param(n, target_shape, device, dtype)
 
         dhdt_physics = calculate_dhdt_physics(
             h=h_pred,
             U=U_grid,
             K_f=K_f_val, # 使用处理后的 K_f
-            m=float(m),  # 确保 m, n 是浮点数
-            n=float(n),
+            m=m_val,
+            n=n_val,
             K_d=K_d_val, # 使用处理后的 K_d
             dx=dx,
             dy=dy,
@@ -120,9 +196,7 @@ def compute_pde_residual_dual_output(outputs: Dict[str, torch.Tensor], physics_p
 
     except Exception as e:
         logging.error(f"计算双输出 PDE 残差时出错: {e}", exc_info=True)
-        # 返回一个零损失，但保留梯度连接（如果可能）
-        zero_loss = (outputs['state'].sum() + outputs['derivative'].sum()) * 0.0
-        return zero_loss
+        raise RuntimeError("Failed to compute dual-output PDE residual") from e
 
 # --- Smoothness Penalty ---
 
@@ -153,7 +227,10 @@ def compute_total_loss(
     physics_loss_value: Optional[torch.Tensor],
     smoothness_pred: Optional[torch.Tensor], # Prediction used for smoothness (can be same as data_pred)
     physics_params: Dict, # Still needed for dx, dy for smoothness
-    loss_weights: Dict[str, float]
+    loss_weights: Dict[str, float],
+    initial_topo: Optional[torch.Tensor] = None,
+    derivative_pred: Optional[torch.Tensor] = None,
+    dt: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     计算总加权损失。
@@ -164,7 +241,8 @@ def compute_total_loss(
         physics_loss_value: 预先计算的物理损失 (PDE 残差)。
         smoothness_pred: 用于平滑度损失的模型预测。
         physics_params: 包含物理参数的字典 (例如，dx, dy)。
-        loss_weights: 映射损失分量名称 ('data', 'physics', 'smoothness') 到权重的字典。
+        loss_weights: 映射损失分量名称 ('data', 'increment', 'derivative_data',
+            'physics', 'smoothness') 到权重的字典。
 
     Returns:
         tuple: (total_loss, weighted_losses_dict)
@@ -177,6 +255,8 @@ def compute_total_loss(
     ref_tensor_for_grad = None
     if data_pred is not None: ref_tensor_for_grad = data_pred
     elif target_topo is not None: ref_tensor_for_grad = target_topo
+    elif derivative_pred is not None: ref_tensor_for_grad = derivative_pred
+    elif initial_topo is not None: ref_tensor_for_grad = initial_topo
     elif physics_loss_value is not None: ref_tensor_for_grad = physics_loss_value
     elif smoothness_pred is not None: ref_tensor_for_grad = smoothness_pred
 
@@ -202,6 +282,36 @@ def compute_total_loss(
              loss_components['data'] = _zero_with_grad(ref_tensor_for_grad)
     else:
         loss_components['data'] = _zero_with_grad(ref_tensor_for_grad)
+
+    # 1b. 增量损失：约束地形变化量 Δh
+    increment_weight = loss_weights.get('increment', 0.0)
+    if increment_weight > 0 and data_pred is not None and target_topo is not None and initial_topo is not None:
+        try:
+            loss_components['increment'] = compute_increment_loss(data_pred, target_topo, initial_topo)
+        except Exception as e:
+             logging.error(f"计算增量损失时出错: {e}", exc_info=True)
+             loss_components['increment'] = _zero_with_grad(ref_tensor_for_grad)
+    else:
+        loss_components['increment'] = _zero_with_grad(ref_tensor_for_grad)
+
+    # 1c. 导数监督损失：约束 dh/dt 头与有限差分一致
+    derivative_data_weight = loss_weights.get('derivative_data', 0.0)
+    if (
+        derivative_data_weight > 0
+        and derivative_pred is not None
+        and target_topo is not None
+        and initial_topo is not None
+        and dt is not None
+    ):
+        try:
+            loss_components['derivative_data'] = compute_temporal_derivative_loss(
+                derivative_pred, initial_topo, target_topo, dt
+            )
+        except Exception as e:
+             logging.error(f"计算导数监督损失时出错: {e}", exc_info=True)
+             loss_components['derivative_data'] = _zero_with_grad(ref_tensor_for_grad)
+    else:
+        loss_components['derivative_data'] = _zero_with_grad(ref_tensor_for_grad)
 
     # 2. 物理残差损失 (使用预计算的值)
     physics_weight = loss_weights.get('physics', 0.0)

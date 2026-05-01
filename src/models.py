@@ -5,6 +5,30 @@ import logging
 import torch.nn.functional as F
 import math # For sqrt(2) in AdaptiveFastscapePINN tiling (if needed)
 from .utils import standardize_coordinate_system, prepare_parameter # Assuming these will be in utils.py
+from .physics import calculate_drainage_area_soft_mfd_torch, calculate_slope_magnitude
+
+def _resolve_activation_fn(activation_fn):
+    """Resolve a config activation value to an nn.Module class."""
+    if isinstance(activation_fn, str):
+        activation_map = {
+            'tanh': nn.Tanh,
+            'relu': nn.ReLU,
+            'leakyrelu': nn.LeakyReLU,
+            'leaky_relu': nn.LeakyReLU,
+            'gelu': nn.GELU,
+            'sigmoid': nn.Sigmoid,
+            'silu': nn.SiLU,
+            'swish': nn.SiLU,
+        }
+        key = activation_fn.replace('-', '_').lower()
+        if key not in activation_map:
+            raise ValueError(f"Unsupported activation function: {activation_fn}")
+        return activation_map[key]
+    if isinstance(activation_fn, type) and issubclass(activation_fn, nn.Module):
+        return activation_fn
+    if isinstance(activation_fn, nn.Module):
+        return activation_fn.__class__
+    raise TypeError(f"activation_fn must be a string or nn.Module class, got {type(activation_fn)}")
 
 # --- Base Class for Dual Output ---
 class TimeDerivativePINN(nn.Module):
@@ -114,6 +138,484 @@ class TimeDerivativePINN(nn.Module):
         return derivative_fd
 
 
+class _ConvNormAct(nn.Module):
+    """Small convolution block used by LandscapeUNetPINO."""
+
+    def __init__(self, in_channels, out_channels, activation_fn=nn.GELU):
+        super().__init__()
+        activation_cls = _resolve_activation_fn(activation_fn)
+        num_groups = min(8, out_channels)
+        while out_channels % num_groups != 0 and num_groups > 1:
+            num_groups -= 1
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(num_groups, out_channels),
+            activation_cls(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(num_groups, out_channels),
+            activation_cls(),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class LandscapeUNetPINO(TimeDerivativePINN):
+    """
+    U-Net style step operator for the current Fastscape PDE constraint.
+
+    Inputs in predict_state mode:
+      h_t, K_f, K_d, U, m, n, precip, t/dt, x, y
+
+    Outputs:
+      state: h_{t+dt}
+      derivative: dh/dt
+    """
+
+    def __init__(
+        self,
+        output_dim=1,
+        input_channels=10,
+        hidden_channels=32,
+        channel_multipliers=(1, 2, 4),
+        activation_fn='GELU',
+        domain_x=(0.0, 1.0),
+        domain_y=(0.0, 1.0),
+        predict_residual=True,
+    ):
+        super().__init__()
+        self.output_dim = output_dim
+        self.input_channels = input_channels
+        self.hidden_channels = hidden_channels
+        self.channel_multipliers = tuple(channel_multipliers)
+        self.predict_residual = predict_residual
+        self.domain_x, self.domain_y = self._validate_domain(domain_x, domain_y)
+
+        channels = [hidden_channels * mult for mult in self.channel_multipliers]
+        self.stem = _ConvNormAct(input_channels, channels[0], activation_fn)
+        self.down_blocks = nn.ModuleList()
+        self.pools = nn.ModuleList()
+        for in_ch, out_ch in zip(channels[:-1], channels[1:]):
+            self.pools.append(nn.MaxPool2d(2))
+            self.down_blocks.append(_ConvNormAct(in_ch, out_ch, activation_fn))
+
+        self.bottleneck = _ConvNormAct(channels[-1], channels[-1], activation_fn)
+
+        self.up_blocks = nn.ModuleList()
+        reversed_channels = list(reversed(channels))
+        for in_ch, skip_ch in zip(reversed_channels[:-1], reversed_channels[1:]):
+            self.up_blocks.append(_ConvNormAct(in_ch + skip_ch, skip_ch, activation_fn))
+
+        self.delta_head = nn.Conv2d(channels[0], output_dim, kernel_size=1)
+        self.derivative_head = nn.Conv2d(channels[0], output_dim, kernel_size=1)
+        self._init_weights()
+
+    def _validate_domain(self, domain_x, domain_y):
+        try:
+            domain_x = [float(domain_x[0]), float(domain_x[1])]
+            domain_y = [float(domain_y[0]), float(domain_y[1])]
+        except (TypeError, ValueError, IndexError) as e:
+            raise ValueError(f"domain_x and domain_y must be length-2 numeric sequences. Error: {e}") from e
+        if domain_x[0] >= domain_x[1] or domain_y[0] >= domain_y[1]:
+            raise ValueError(f"Domain boundaries must have min < max. Got domain_x={domain_x}, domain_y={domain_y}")
+        return domain_x, domain_y
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+
+    def _ensure_4d_state(self, initial_state):
+        if initial_state.ndim == 2:
+            return initial_state.unsqueeze(0).unsqueeze(0)
+        if initial_state.ndim == 3:
+            return initial_state.unsqueeze(1)
+        if initial_state.ndim == 4:
+            return initial_state
+        raise ValueError(f"initial_state must be 2D, 3D, or 4D. Got shape {initial_state.shape}")
+
+    def _get_param(self, params, keys, default):
+        for key in keys:
+            if key in params and params[key] is not None:
+                return params[key]
+        return default
+
+    def _param_channel(self, params, keys, default, target_shape, batch_size, device, dtype, name):
+        value = self._get_param(params, keys, default)
+        return prepare_parameter(value, target_shape, batch_size, device, dtype, param_name=name)
+
+    def _time_channel(self, t_target, target_shape, batch_size, device, dtype):
+        time_grid = prepare_parameter(t_target, target_shape, batch_size, device, dtype, param_name='t_target')
+        domain_scale = max(abs(float(t_target.max().item())) if isinstance(t_target, torch.Tensor) and t_target.numel() > 0 else 1.0, 1.0)
+        return time_grid / domain_scale
+
+    def _coord_channels(self, target_shape, batch_size, device, dtype):
+        height, width = target_shape
+        y = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype).view(1, 1, height, 1)
+        x = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype).view(1, 1, 1, width)
+        return x.expand(batch_size, 1, height, width), y.expand(batch_size, 1, height, width)
+
+    def _build_operator_input(self, initial_state, params, t_target):
+        initial_state = self._ensure_4d_state(initial_state)
+        batch_size, _, height, width = initial_state.shape
+        device, dtype = initial_state.device, initial_state.dtype
+        target_shape = (height, width)
+
+        k_f = self._param_channel(params, ('K', 'K_f', 'k_f'), 1e-5, target_shape, batch_size, device, dtype, 'K_f')
+        k_d = self._param_channel(params, ('D', 'K_d', 'k_d'), 0.01, target_shape, batch_size, device, dtype, 'K_d')
+        uplift = self._param_channel(params, ('U', 'uplift_rate'), 0.0, target_shape, batch_size, device, dtype, 'U')
+        m = self._param_channel(params, ('m',), 0.5, target_shape, batch_size, device, dtype, 'm')
+        n = self._param_channel(params, ('n',), 1.0, target_shape, batch_size, device, dtype, 'n')
+        precip = self._param_channel(params, ('precip', 'P'), 1.0, target_shape, batch_size, device, dtype, 'precip')
+        time = self._time_channel(t_target, target_shape, batch_size, device, dtype)
+        x_coord, y_coord = self._coord_channels(target_shape, batch_size, device, dtype)
+
+        return torch.cat([initial_state, k_f, k_d, uplift, m, n, precip, time, x_coord, y_coord], dim=1), initial_state
+
+    def _forward_features(self, x):
+        skips = []
+        x = self.stem(x)
+        skips.append(x)
+        for pool, block in zip(self.pools, self.down_blocks):
+            x = block(pool(x))
+            skips.append(x)
+
+        x = self.bottleneck(x)
+        skips = skips[:-1][::-1]
+        for block, skip in zip(self.up_blocks, skips):
+            x = F.interpolate(x, size=skip.shape[-2:], mode='bilinear', align_corners=False)
+            x = block(torch.cat([x, skip], dim=1))
+        return x
+
+    def forward(self, x, mode='predict_state'):
+        if mode != 'predict_state':
+            raise ValueError("LandscapeUNetPINO currently supports only mode='predict_state'.")
+        if not isinstance(x, dict):
+            raise TypeError("LandscapeUNetPINO expects a dict input in predict_state mode.")
+
+        initial_state = x.get('initial_state')
+        params = x.get('params', {})
+        t_target = x.get('t_target', 1.0)
+        if initial_state is None:
+            raise ValueError("LandscapeUNetPINO input must include 'initial_state'.")
+
+        operator_input, initial_state_4d = self._build_operator_input(initial_state, params, t_target)
+        features = self._forward_features(operator_input)
+        delta = self.delta_head(features)
+        derivative = self.derivative_head(features)
+
+        outputs = {}
+        if self.output_state:
+            outputs['state'] = initial_state_4d + delta if self.predict_residual else delta
+        if self.output_derivative:
+            outputs['derivative'] = derivative
+        return outputs
+
+
+class SpectralConv2d(nn.Module):
+    """2D Fourier layer used by the Landscape Neural Operator."""
+
+    def __init__(self, in_channels, out_channels, modes1=12, modes2=12):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes1 = int(modes1)
+        self.modes2 = int(modes2)
+        scale = 1.0 / max(1, in_channels * out_channels)
+        self.weights_pos = nn.Parameter(
+            scale * torch.randn(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat)
+        )
+        self.weights_neg = nn.Parameter(
+            scale * torch.randn(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat)
+        )
+
+    @staticmethod
+    def _compl_mul2d(input_ft, weights):
+        return torch.einsum("bixy,ioxy->boxy", input_ft, weights)
+
+    def forward(self, x):
+        batch_size, _, height, width = x.shape
+        x_ft = torch.fft.rfft2(x, norm="ortho")
+        out_ft = torch.zeros(
+            batch_size,
+            self.out_channels,
+            height,
+            width // 2 + 1,
+            device=x.device,
+            dtype=x_ft.dtype,
+        )
+
+        modes1 = min(self.modes1, height)
+        modes2 = min(self.modes2, width // 2 + 1)
+        if modes1 > 0 and modes2 > 0:
+            weights_pos = self.weights_pos[:, :, :modes1, :modes2].to(dtype=x_ft.dtype, device=x.device)
+            weights_neg = self.weights_neg[:, :, :modes1, :modes2].to(dtype=x_ft.dtype, device=x.device)
+            out_ft[:, :, :modes1, :modes2] = self._compl_mul2d(x_ft[:, :, :modes1, :modes2], weights_pos)
+            out_ft[:, :, -modes1:, :modes2] = self._compl_mul2d(x_ft[:, :, -modes1:, :modes2], weights_neg)
+
+        return torch.fft.irfft2(out_ft, s=(height, width), norm="ortho")
+
+
+class FNOBlock2d(nn.Module):
+    """Residual FNO block with a local 1x1 path."""
+
+    def __init__(self, channels, modes1=12, modes2=12, activation_fn='GELU'):
+        super().__init__()
+        activation_cls = _resolve_activation_fn(activation_fn)
+        num_groups = min(8, channels)
+        while channels % num_groups != 0 and num_groups > 1:
+            num_groups -= 1
+        self.spectral = SpectralConv2d(channels, channels, modes1=modes1, modes2=modes2)
+        self.pointwise = nn.Conv2d(channels, channels, kernel_size=1)
+        self.norm = nn.GroupNorm(num_groups, channels)
+        self.activation = activation_cls()
+
+    def forward(self, x):
+        residual = x
+        x = self.spectral(x) + self.pointwise(x)
+        x = self.activation(self.norm(x))
+        return x + residual
+
+
+class DifferentiableFlowGraphBranch(nn.Module):
+    """
+    Soft flow-graph branch.
+
+    It converts the current topography into hydrology-aware raster features by
+    running differentiable soft-MFD flow accumulation and projecting
+    [log drainage area, slope] into the operator feature space.
+    """
+
+    def __init__(
+        self,
+        out_channels,
+        hidden_channels=16,
+        num_iters=32,
+        temperature=0.05,
+        slope_power=1.0,
+        leak_rate=1e-3,
+        positive_fn='relu',
+        activation_fn='GELU',
+    ):
+        super().__init__()
+        self.num_iters = int(num_iters)
+        self.temperature = float(temperature)
+        self.slope_power = float(slope_power)
+        self.leak_rate = float(leak_rate)
+        self.positive_fn = positive_fn
+        self.projector = nn.Sequential(
+            _ConvNormAct(2, hidden_channels, activation_fn),
+            nn.Conv2d(hidden_channels, out_channels, kernel_size=1),
+        )
+
+    def forward(self, h, dx, dy, precip=1.0):
+        area = calculate_drainage_area_soft_mfd_torch(
+            h=h,
+            dx=dx,
+            dy=dy,
+            precip=precip,
+            num_iters=self.num_iters,
+            temperature=self.temperature,
+            slope_power=self.slope_power,
+            leak_rate=self.leak_rate,
+            positive_fn=self.positive_fn,
+        )
+        slope = calculate_slope_magnitude(h, dx, dy)
+        cell_area = max(float(dx) * float(dy), 1e-12)
+        area_feature = torch.log1p(area / cell_area)
+        slope_feature = torch.log1p(torch.clamp(slope, min=0.0))
+        return self.projector(torch.cat([area_feature, slope_feature], dim=1))
+
+
+class LandscapeNeuralOperator(LandscapeUNetPINO):
+    """
+    V2 Landscape Neural Operator for the current Fastscape-style equation.
+
+    Architecture:
+      - raster conditioning input identical to LandscapeUNetPINO;
+      - differentiable soft flow-graph branch for drainage/slope features;
+      - UNO-style encoder/decoder with skip connections;
+      - FNO spectral blocks for long-range regular-grid coupling;
+      - dual heads for h_{t+dt} and dh/dt.
+    """
+
+    def __init__(
+        self,
+        output_dim=1,
+        input_channels=10,
+        hidden_channels=32,
+        channel_multipliers=(1, 2, 4),
+        activation_fn='GELU',
+        domain_x=(0.0, 1.0),
+        domain_y=(0.0, 1.0),
+        predict_residual=True,
+        fno_modes=(12, 12),
+        fno_layers=2,
+        use_flow_graph=True,
+        flow_graph_hidden_channels=16,
+        flow_graph_iters=32,
+        flow_graph_temperature=0.05,
+        flow_graph_slope_power=1.0,
+        flow_graph_leak_rate=1e-3,
+        flow_graph_positive_fn='relu',
+    ):
+        TimeDerivativePINN.__init__(self)
+        self.output_dim = output_dim
+        self.input_channels = input_channels
+        self.hidden_channels = hidden_channels
+        self.channel_multipliers = tuple(channel_multipliers)
+        self.predict_residual = predict_residual
+        self.domain_x, self.domain_y = self._validate_domain(domain_x, domain_y)
+        self.use_flow_graph = bool(use_flow_graph)
+
+        if len(self.channel_multipliers) < 1:
+            raise ValueError("channel_multipliers must contain at least one level.")
+        if isinstance(fno_modes, int):
+            fno_modes = (fno_modes, fno_modes)
+        self.fno_modes = (int(fno_modes[0]), int(fno_modes[1]))
+
+        channels = [hidden_channels * mult for mult in self.channel_multipliers]
+        self.stem = _ConvNormAct(input_channels, channels[0], activation_fn)
+        if self.use_flow_graph:
+            self.flow_graph = DifferentiableFlowGraphBranch(
+                out_channels=channels[0],
+                hidden_channels=flow_graph_hidden_channels,
+                num_iters=flow_graph_iters,
+                temperature=flow_graph_temperature,
+                slope_power=flow_graph_slope_power,
+                leak_rate=flow_graph_leak_rate,
+                positive_fn=flow_graph_positive_fn,
+                activation_fn=activation_fn,
+            )
+        else:
+            self.flow_graph = None
+
+        self.encoder_fno_blocks = nn.ModuleList([
+            FNOBlock2d(ch, modes1=self.fno_modes[0], modes2=self.fno_modes[1], activation_fn=activation_fn)
+            for ch in channels
+        ])
+        self.pools = nn.ModuleList()
+        self.down_blocks = nn.ModuleList()
+        for in_ch, out_ch in zip(channels[:-1], channels[1:]):
+            self.pools.append(nn.AvgPool2d(2))
+            self.down_blocks.append(_ConvNormAct(in_ch, out_ch, activation_fn))
+
+        self.bottleneck = _ConvNormAct(channels[-1], channels[-1], activation_fn)
+        self.bottleneck_fno = nn.ModuleList([
+            FNOBlock2d(channels[-1], modes1=self.fno_modes[0], modes2=self.fno_modes[1], activation_fn=activation_fn)
+            for _ in range(max(0, int(fno_layers)))
+        ])
+
+        self.up_blocks = nn.ModuleList()
+        self.up_fno_blocks = nn.ModuleList()
+        reversed_channels = list(reversed(channels))
+        for in_ch, skip_ch in zip(reversed_channels[:-1], reversed_channels[1:]):
+            self.up_blocks.append(_ConvNormAct(in_ch + skip_ch, skip_ch, activation_fn))
+            self.up_fno_blocks.append(
+                FNOBlock2d(skip_ch, modes1=self.fno_modes[0], modes2=self.fno_modes[1], activation_fn=activation_fn)
+            )
+
+        self.delta_head = nn.Conv2d(channels[0], output_dim, kernel_size=1)
+        self.derivative_head = nn.Conv2d(channels[0], output_dim, kernel_size=1)
+        self._init_weights()
+
+    def _grid_spacing(self, height, width):
+        dx = (self.domain_x[1] - self.domain_x[0]) / max(width - 1, 1)
+        dy = (self.domain_y[1] - self.domain_y[0]) / max(height - 1, 1)
+        return float(dx), float(dy)
+
+    def _forward_features(self, x, initial_state=None, params=None):
+        x = self.stem(x)
+        if self.flow_graph is not None and initial_state is not None:
+            _, _, height, width = initial_state.shape
+            dx, dy = self._grid_spacing(height, width)
+            precip = self._get_param(params or {}, ('precip', 'P'), 1.0)
+            x = x + self.flow_graph(initial_state, dx=dx, dy=dy, precip=precip)
+
+        skips = []
+        for level_idx, (pool, down_block) in enumerate(zip(self.pools, self.down_blocks)):
+            x = self.encoder_fno_blocks[level_idx](x)
+            skips.append(x)
+            x = down_block(pool(x))
+
+        x = self.encoder_fno_blocks[len(self.down_blocks)](x)
+        x = self.bottleneck(x)
+        for fno_block in self.bottleneck_fno:
+            x = fno_block(x)
+
+        for block, fno_block, skip in zip(self.up_blocks, self.up_fno_blocks, reversed(skips)):
+            x = F.interpolate(x, size=skip.shape[-2:], mode='bilinear', align_corners=False)
+            x = block(torch.cat([x, skip], dim=1))
+            x = fno_block(x)
+        return x
+
+    def forward(self, x, mode='predict_state'):
+        if mode != 'predict_state':
+            raise ValueError("LandscapeNeuralOperator currently supports only mode='predict_state'.")
+        if not isinstance(x, dict):
+            raise TypeError("LandscapeNeuralOperator expects a dict input in predict_state mode.")
+
+        initial_state = x.get('initial_state')
+        params = x.get('params', {})
+        t_target = x.get('t_target', 1.0)
+        if initial_state is None:
+            raise ValueError("LandscapeNeuralOperator input must include 'initial_state'.")
+
+        operator_input, initial_state_4d = self._build_operator_input(initial_state, params, t_target)
+        features = self._forward_features(operator_input, initial_state=initial_state_4d, params=params)
+        delta = self.delta_head(features)
+        derivative = self.derivative_head(features)
+
+        outputs = {}
+        if self.output_state:
+            outputs['state'] = initial_state_4d + delta if self.predict_residual else delta
+        if self.output_derivative:
+            outputs['derivative'] = derivative
+        return outputs
+
+
+def build_model_from_config(model_config):
+    """Builds a supported model from a plain config dictionary."""
+    model_config = dict(model_config)
+    model_name = model_config.pop('name', 'AdaptiveFastscapePINN')
+    registry = {
+        'AdaptiveFastscapePINN': AdaptiveFastscapePINN,
+        'adaptive_fastscape_pinn': AdaptiveFastscapePINN,
+        'LandscapeUNetPINO': LandscapeUNetPINO,
+        'landscape_unet_pino': LandscapeUNetPINO,
+        'LandscapeNeuralOperator': LandscapeNeuralOperator,
+        'landscape_neural_operator': LandscapeNeuralOperator,
+        'LandscapeFNOFlowPINO': LandscapeNeuralOperator,
+        'landscape_fno_flow_pino': LandscapeNeuralOperator,
+    }
+    if model_name not in registry:
+        raise ValueError(f"Unsupported model name: {model_name}. Available: {sorted(registry.keys())}")
+    return registry[model_name](**model_config)
+
+
+def cast_floating_module_dtype(module: nn.Module, dtype: torch.dtype) -> nn.Module:
+    """
+    Cast only real floating parameters/buffers.
+
+    FNO layers store complex Fourier weights. Calling module.to(dtype=float32)
+    on the whole model would cast complex weights to real and discard their
+    imaginary part. This helper keeps complex parameters complex while aligning
+    ordinary Conv/Norm/Linear weights with the requested real dtype.
+    """
+    for submodule in module.modules():
+        for name, param in list(submodule._parameters.items()):
+            if param is not None and torch.is_floating_point(param):
+                param.data = param.data.to(dtype=dtype)
+                if param.grad is not None:
+                    param.grad.data = param.grad.data.to(dtype=dtype)
+        for name, buffer in list(submodule._buffers.items()):
+            if buffer is not None and torch.is_floating_point(buffer):
+                submodule._buffers[name] = buffer.to(dtype=dtype)
+    return module
+
+
 # --- AdaptiveFastscapePINN (Dual Output, Refactored) ---
 class AdaptiveFastscapePINN(TimeDerivativePINN):
     """
@@ -184,6 +686,8 @@ class AdaptiveFastscapePINN(TimeDerivativePINN):
         self.domain_x = domain_x
         self.domain_y = domain_y
         self.epsilon = 1e-9 # For safe division during normalization
+
+        activation_fn = _resolve_activation_fn(activation_fn)
 
         # --- Coordinate MLP Feature Extractor (Integrated) ---
         activation = activation_fn() # Instantiate activation function

@@ -11,6 +11,7 @@ run_options:                             # 运行选项 (传递给 trainer)
 # --- 数据设置 ---
 data:
   processed_dir: data/processed          # 处理后的数据目录 (相对路径)
+  sample_mode: pair                      # pair 或 trajectory；trajectory 会把一个轨迹文件展开成多步样本
   train_split: 0.8                       # 训练集比例
   val_split: 0.1                         # 验证集比例 (测试集比例自动计算)
   num_workers: 0                         # DataLoader 工作进程数 (0 表示主进程)
@@ -19,7 +20,7 @@ data:
     compute_stats: true                  # 如果 stats_file 不存在，是否从训练集计算统计数据
     stats_file: ${data.processed_dir}/norm_stats.json # 归一化统计数据文件路径 (使用 OmegaConf 插值)
 
-# --- 模型设置 (固定为 AdaptiveFastscapePINN) ---
+# --- 模型设置 (默认 baseline: AdaptiveFastscapePINN) ---
 model:
   # AdaptiveFastscapePINN 的参数
   output_dim: 1
@@ -86,6 +87,8 @@ training:
   # 损失权重 (固定使用双输出物理损失)
   loss_weights:
     data: 1.0                            # 数据损失权重
+    increment: 0.5                       # 地形变化量 Δh 监督，增强 step-operator 学习
+    derivative_data: 0.1                 # 用有限差分监督 dh/dt 输出头
     physics: 0.1                         # 双输出物理残差损失权重
     smoothness: 0.001                    # 平滑度惩罚权重
 

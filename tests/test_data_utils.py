@@ -12,7 +12,13 @@ from unittest.mock import patch, MagicMock, call, ANY
 
 # 导入被测试的模块
 from src import data_utils
-from src.data_utils import FastscapeDataset, collate_fn_filter_none, compute_normalization_stats, create_dataloaders
+from src.data_utils import (
+    FastscapeDataset,
+    TrajectoryFastscapeDataset,
+    collate_fn_filter_none,
+    compute_normalization_stats,
+    create_dataloaders,
+)
 
 # --- Fixtures ---
 
@@ -165,6 +171,9 @@ def test_fastscape_dataset_getitem_basic(dummy_pt_files):
     assert 'm' in sample and isinstance(sample['m'], torch.Tensor)
     assert 'n' in sample and isinstance(sample['n'], torch.Tensor)
     assert 'run_time' in sample and isinstance(sample['run_time'], torch.Tensor)
+    assert torch.equal(sample['state_t'], sample['initial_topo'])
+    assert torch.equal(sample['state_next'], sample['final_topo'])
+    assert torch.equal(sample['dt'], sample['run_time'])
     assert 'target_shape' in sample and sample['target_shape'] == (10, 10)
 
     # 检查数据类型是否为 float32
@@ -275,6 +284,40 @@ def test_fastscape_dataset_transform(dummy_pt_files):
     # 检查 transform 是否被调用，并且返回的是 transform 的结果
     assert sample == {'transformed': True}
 
+
+def test_trajectory_dataset_expands_transition_samples(temp_data_dir):
+    """测试 trajectory 文件会被展开为连续单步样本。"""
+    trajectory = torch.stack([
+        torch.zeros(1, 4, 4),
+        torch.ones(1, 4, 4),
+        torch.ones(1, 4, 4) * 3,
+    ])
+    data = {
+        'trajectory_topo': trajectory,
+        'time': torch.tensor([0.0, 2.0, 5.0]),
+        'uplift_rate': torch.tensor(0.001),
+        'k_f': torch.tensor(1e-5),
+        'k_d': torch.tensor(0.01),
+        'm': torch.tensor(0.5),
+        'n': torch.tensor(1.0),
+    }
+    path = temp_data_dir / "trajectory_sample.pt"
+    torch.save(data, path)
+
+    dataset = TrajectoryFastscapeDataset([str(path)])
+
+    assert len(dataset) == 2
+    first = dataset[0]
+    second = dataset[1]
+    assert torch.equal(first['initial_topo'], trajectory[0])
+    assert torch.equal(first['final_topo'], trajectory[1])
+    assert first['dt'].item() == pytest.approx(2.0)
+    assert torch.equal(second['initial_topo'], trajectory[1])
+    assert torch.equal(second['final_topo'], trajectory[2])
+    assert second['dt'].item() == pytest.approx(3.0)
+    assert torch.equal(first['state_t'], first['initial_topo'])
+    assert torch.equal(first['state_next'], first['final_topo'])
+
 # --- 测试 collate_fn_filter_none ---
 
 def test_collate_fn_filter_none_all_valid():
@@ -353,6 +396,26 @@ def test_compute_normalization_stats_success(dummy_pt_files):
     assert stats['k_d']['max'] == pytest.approx(max(all_kd))
 
 
+def test_compute_normalization_stats_reads_trajectory_topography(temp_data_dir):
+    """测试归一化统计会读取 trajectory_topo 的所有时间步。"""
+    path = temp_data_dir / "trajectory_stats.pt"
+    data = {
+        'trajectory_topo': torch.tensor([
+            [[[0.0, 1.0], [2.0, 3.0]]],
+            [[[4.0, 5.0], [6.0, 7.0]]],
+        ]),
+        'uplift_rate': torch.tensor(0.001),
+        'k_f': torch.tensor(1e-5),
+        'k_d': torch.tensor(0.01),
+    }
+    torch.save(data, path)
+
+    stats = compute_normalization_stats([str(path)], ['topo'])
+
+    assert stats['topo']['min'] == pytest.approx(0.0)
+    assert stats['topo']['max'] == pytest.approx(7.0)
+
+
 def test_compute_normalization_stats_empty_list(caplog):
     """测试 compute_normalization_stats 处理空文件列表。"""
     with caplog.at_level(logging.WARNING):
@@ -428,6 +491,30 @@ def test_create_dataloaders_success_load_stats(dummy_config, dummy_pt_files, dum
         assert result['train'].dataset.normalize is True
         assert result['train'].dataset.norm_stats == dummy_norm_stats
         mock_json_load.assert_called_once() # 确认加载了文件
+
+
+def test_create_dataloaders_trajectory_mode(dummy_config, temp_data_dir):
+    """测试 create_dataloaders 可以创建 trajectory dataset。"""
+    path = temp_data_dir / "trajectory_loader.pt"
+    torch.save({
+        'trajectory_topo': torch.rand(3, 1, 4, 4),
+        'time': torch.tensor([0.0, 1.0, 2.0]),
+        'uplift_rate': torch.tensor(0.001),
+        'k_f': torch.tensor(1e-5),
+        'k_d': torch.tensor(0.01),
+        'm': torch.tensor(0.5),
+        'n': torch.tensor(1.0),
+    }, path)
+    dummy_config['data']['sample_mode'] = 'trajectory'
+    dummy_config['data']['normalization']['enabled'] = False
+    dummy_config['data']['train_split'] = 1.0
+    dummy_config['data']['val_split'] = 0.0
+
+    with patch('glob.glob', return_value=[str(path)]), patch('random.shuffle'):
+        result = create_dataloaders(dummy_config)
+
+    assert isinstance(result['train'].dataset, TrajectoryFastscapeDataset)
+    assert len(result['train'].dataset) == 2
 
 @patch('glob.glob')
 @patch('random.shuffle')

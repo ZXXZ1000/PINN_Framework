@@ -67,7 +67,7 @@ def _calculate_dinf_weights_sparse(
     h_center = h_padded[:, :, 1:-1, 1:-1]
     for k, (dr, dc) in enumerate(neighbor_offsets):
         h_neighbor = h_padded[:, :, 1 + dr: height + 1 + dr, 1 + dc: width + 1 + dc]
-        slopes[:, k, :, :] = (h_center - h_neighbor) / (neighbor_distances[k] + eps)
+        slopes[:, k, :, :] = ((h_center - h_neighbor) / (neighbor_distances[k] + eps)).squeeze(1)
     slopes = torch.clamp(slopes, min=0)
     total_positive_slope = torch.sum(slopes, dim=1, keepdim=True)
 
@@ -91,7 +91,9 @@ def _calculate_dinf_weights_sparse(
 
                 cell_slopes = slopes[b, :, r, c]
                 cell_alpha = alpha[b, 0, r, c] % (2 * math.pi)
-                sector_float = cell_alpha / (math.pi / 4)
+                sector_float = float((cell_alpha / (math.pi / 4)).detach())
+                if not math.isfinite(sector_float):
+                    continue
                 sector_idx = int(math.floor(sector_float)) % 8
                 idx1, idx2 = sector_idx, (sector_idx + 1) % 8
                 angle1, angle2 = neighbor_angles[idx1], neighbor_angles[idx2] if idx1 < 7 else 2 * math.pi
@@ -101,21 +103,25 @@ def _calculate_dinf_weights_sparse(
                 p2 = relative_alpha / total_angle if total_angle > eps else 0.5
                 p1 = 1.0 - p2
 
-                if cell_slopes[idx1] < eps and cell_slopes[idx2] >= eps: p1, p2 = 0.0, 1.0
-                elif cell_slopes[idx2] < eps and cell_slopes[idx1] >= eps: p1, p2 = 1.0, 0.0
+                if cell_slopes[idx1] < eps and cell_slopes[idx2] >= eps:
+                    p1 = torch.zeros((), device=device, dtype=dtype)
+                    p2 = torch.ones((), device=device, dtype=dtype)
+                elif cell_slopes[idx2] < eps and cell_slopes[idx1] >= eps:
+                    p1 = torch.ones((), device=device, dtype=dtype)
+                    p2 = torch.zeros((), device=device, dtype=dtype)
 
                 if (r, c) not in neighbor_maps:
                     coords, codes = _get_neighbor_coords(r, c, height, width)
                     neighbor_maps[(r, c)] = {int(co.item()): (int(crds[0].item()), int(crds[1].item())) for co, crds in zip(codes, coords)}
                 cell_neighbor_map = neighbor_maps[(r, c)]
 
-                if p1 > eps and idx1 in cell_neighbor_map:
+                if float(torch.as_tensor(p1).detach()) > eps and idx1 in cell_neighbor_map:
                     nr1, nc1 = cell_neighbor_map[idx1]
                     neighbor1_idx_1d = _map_to_1d(nr1, nc1, width) + b * N_grid
                     row_indices.append(neighbor1_idx_1d)
                     col_indices.append(cell_idx_1d)
                     weight_values.append(p1)
-                if p2 > eps and idx2 in cell_neighbor_map:
+                if float(torch.as_tensor(p2).detach()) > eps and idx2 in cell_neighbor_map:
                     nr2, nc2 = cell_neighbor_map[idx2]
                     neighbor2_idx_1d = _map_to_1d(nr2, nc2, width) + b * N_grid
                     row_indices.append(neighbor2_idx_1d)
@@ -124,7 +130,11 @@ def _calculate_dinf_weights_sparse(
 
     rows = torch.tensor(row_indices, dtype=torch.long, device=device)
     cols = torch.tensor(col_indices, dtype=torch.long, device=device)
-    vals = torch.tensor(weight_values, dtype=dtype, device=device) if weight_values else torch.tensor([], dtype=dtype, device=device)
+    vals = torch.stack([
+        value.detach().to(device=device, dtype=dtype) if isinstance(value, torch.Tensor)
+        else torch.tensor(value, dtype=dtype, device=device)
+        for value in weight_values
+    ]) if weight_values else torch.tensor([], dtype=dtype, device=device)
 
     return rows, cols, vals
 
@@ -319,6 +329,220 @@ def calculate_drainage_area_ida_dinf_torch(
     return drainage_area
 
 
+_FLOW_NEIGHBOR_OFFSETS = [
+    (0, 1),    # E
+    (-1, 1),   # NE
+    (-1, 0),   # N
+    (-1, -1),  # NW
+    (0, -1),   # W
+    (1, -1),   # SW
+    (1, 0),    # S
+    (1, 1),    # SE
+]
+
+
+def _neighbor_values(tensor: torch.Tensor, dr: int, dc: int) -> torch.Tensor:
+    """Returns values at neighbor offset (dr, dc) for every source cell."""
+    _, _, height, width = tensor.shape
+    src_y0 = max(0, dr)
+    src_y1 = height + min(0, dr)
+    src_x0 = max(0, dc)
+    src_x1 = width + min(0, dc)
+    pad_top = max(0, -dr)
+    pad_bottom = max(0, dr)
+    pad_left = max(0, -dc)
+    pad_right = max(0, dc)
+    cropped = tensor[:, :, src_y0:src_y1, src_x0:src_x1]
+    return F.pad(cropped, (pad_left, pad_right, pad_top, pad_bottom))
+
+
+def _valid_neighbor_mask(reference: torch.Tensor, dr: int, dc: int) -> torch.Tensor:
+    """Builds a 0/1 mask for source cells that have the requested neighbor."""
+    return _neighbor_values(torch.ones_like(reference), dr, dc)
+
+
+def _send_to_neighbor(source_contribution: torch.Tensor, dr: int, dc: int) -> torch.Tensor:
+    """Moves source-cell contributions to their downstream neighbor cells."""
+    _, _, height, width = source_contribution.shape
+    src_y0 = max(0, -dr)
+    src_y1 = height - max(0, dr)
+    src_x0 = max(0, -dc)
+    src_x1 = width - max(0, dc)
+    pad_top = max(0, dr)
+    pad_bottom = max(0, -dr)
+    pad_left = max(0, dc)
+    pad_right = max(0, -dc)
+    cropped = source_contribution[:, :, src_y0:src_y1, src_x0:src_x1]
+    return F.pad(cropped, (pad_left, pad_right, pad_top, pad_bottom))
+
+
+def calculate_soft_mfd_flow_weights(
+    h: torch.Tensor,
+    dx: float,
+    dy: float,
+    temperature: float = 0.05,
+    slope_power: float = 1.0,
+    leak_rate: float = 1e-3,
+    positive_fn: str = "relu",
+    eps: float = 1e-10,
+) -> torch.Tensor:
+    """
+    Calculates differentiable multi-flow-direction routing weights.
+
+    The returned tensor has shape [B, 8, H, W]. Each channel is the fraction
+    of a source cell's water/sediment routed to one neighbor in
+    _FLOW_NEIGHBOR_OFFSETS order. The row sum is <= 1 because leak_rate acts
+    as a local sink/outlet term, which makes unrolled accumulation stable even
+    when soft routing creates small cycles.
+    """
+    if not (isinstance(h, torch.Tensor) and h.ndim == 4 and h.shape[1] == 1):
+        raise ValueError("Input h must be a 4D tensor (B, 1, H, W)")
+    if dx <= 0 or dy <= 0:
+        raise ValueError("dx and dy must be positive.")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive.")
+    if slope_power <= 0:
+        raise ValueError("slope_power must be positive.")
+    if leak_rate < 0:
+        raise ValueError("leak_rate must be non-negative.")
+
+    distances = torch.tensor(
+        [
+            dx,
+            math.sqrt(dx * dx + dy * dy),
+            dy,
+            math.sqrt(dx * dx + dy * dy),
+            dx,
+            math.sqrt(dx * dx + dy * dy),
+            dy,
+            math.sqrt(dx * dx + dy * dy),
+        ],
+        device=h.device,
+        dtype=h.dtype,
+    ).view(1, 8, 1, 1)
+
+    neighbor_heights = []
+    valid_masks = []
+    for dr, dc in _FLOW_NEIGHBOR_OFFSETS:
+        neighbor_heights.append(_neighbor_values(h, dr, dc))
+        valid_masks.append(_valid_neighbor_mask(h, dr, dc))
+    neighbor_heights = torch.cat(neighbor_heights, dim=1)
+    valid_masks = torch.cat(valid_masks, dim=1)
+
+    downhill_slope = (h - neighbor_heights) / (distances + eps)
+    positive_key = str(positive_fn).lower()
+    if positive_key == "softplus":
+        downhill_positive = F.softplus(downhill_slope / temperature) * temperature
+    elif positive_key == "relu":
+        downhill_positive = torch.relu(downhill_slope)
+    else:
+        raise ValueError(f"Unsupported positive_fn: {positive_fn}")
+
+    raw_weights = torch.pow(downhill_positive + eps, slope_power) * valid_masks
+    raw_sum = raw_weights.sum(dim=1, keepdim=True)
+    denominator = raw_sum + float(leak_rate) + eps
+    return raw_weights / denominator
+
+
+def route_flow_downstream(field: torch.Tensor, flow_weights: torch.Tensor) -> torch.Tensor:
+    """
+    Routes a scalar field from source cells to downstream neighbors.
+
+    Args:
+        field: [B, 1, H, W] source-cell quantity.
+        flow_weights: [B, 8, H, W] neighbor fractions from
+            calculate_soft_mfd_flow_weights.
+    """
+    if field.ndim != 4 or field.shape[1] != 1:
+        raise ValueError(f"field must have shape [B, 1, H, W], got {field.shape}")
+    if flow_weights.ndim != 4 or flow_weights.shape[1] != 8:
+        raise ValueError(f"flow_weights must have shape [B, 8, H, W], got {flow_weights.shape}")
+    if field.shape[0] != flow_weights.shape[0] or field.shape[-2:] != flow_weights.shape[-2:]:
+        raise ValueError(f"field shape {field.shape} incompatible with flow_weights shape {flow_weights.shape}")
+
+    routed = torch.zeros_like(field)
+    for idx, (dr, dc) in enumerate(_FLOW_NEIGHBOR_OFFSETS):
+        contribution = field * flow_weights[:, idx:idx + 1, :, :]
+        routed = routed + _send_to_neighbor(contribution, dr, dc)
+    return routed
+
+
+def calculate_drainage_area_soft_mfd_torch(
+    h: torch.Tensor,
+    dx: float,
+    dy: float,
+    precip: Union[float, torch.Tensor] = 1.0,
+    num_iters: int = 64,
+    temperature: float = 0.05,
+    slope_power: float = 1.0,
+    leak_rate: float = 1e-3,
+    positive_fn: str = "relu",
+    eps: float = 1e-10,
+    max_value: Optional[float] = None,
+    verbose: bool = False,
+) -> torch.Tensor:
+    """
+    Differentiable soft-MFD drainage area approximation.
+
+    This is the training-time alternative to the IDA/D∞ sparse solve. It uses
+    differentiable 8-neighbor routing weights and unrolls the accumulation:
+
+        A_{k+1} = P * dx * dy + W(h) A_k
+
+    It is not a bit-for-bit Fastscape flow router. It is a smooth operator
+    designed for PINO-style residual training and can be validated against
+    saved Fastscape/teacher outputs.
+    """
+    if not (isinstance(h, torch.Tensor) and h.ndim == 4 and h.shape[1] == 1):
+        raise ValueError("Input h must be a 4D tensor (B, 1, H, W)")
+    if num_iters <= 0:
+        raise ValueError("num_iters must be positive.")
+
+    device, dtype = h.device, h.dtype
+    batch_size, _, height, width = h.shape
+    cell_area = dx * dy
+
+    if isinstance(precip, (int, float)):
+        source = torch.full((batch_size, 1, height, width), float(precip) * cell_area, dtype=dtype, device=device)
+    elif isinstance(precip, torch.Tensor):
+        precip = precip.to(device=device, dtype=dtype)
+        if precip.shape == h.shape:
+            source = precip * cell_area
+        elif precip.ndim == 1 and precip.shape[0] == batch_size:
+            source = precip.view(batch_size, 1, 1, 1).expand_as(h) * cell_area
+        elif precip.numel() == 1:
+            source = precip.view(1, 1, 1, 1).expand_as(h) * cell_area
+        else:
+            raise ValueError(f"Precip shape {precip.shape} incompatible with h shape {h.shape}")
+    else:
+        raise TypeError(f"Unsupported precip type: {type(precip)}")
+
+    flow_weights = calculate_soft_mfd_flow_weights(
+        h=h,
+        dx=dx,
+        dy=dy,
+        temperature=temperature,
+        slope_power=slope_power,
+        leak_rate=leak_rate,
+        positive_fn=positive_fn,
+        eps=eps,
+    )
+
+    area = source
+    for _ in range(int(num_iters)):
+        area = source + route_flow_downstream(area, flow_weights)
+        if max_value is not None:
+            area = torch.clamp(area, min=0.0, max=float(max_value))
+
+    area = torch.clamp(area, min=0.0)
+    if verbose:
+        logging.info(
+            "Soft-MFD drainage area: grid=%sx%s, batch=%s, iters=%s, max=%.4e",
+            height, width, batch_size, num_iters, float(area.detach().max().item())
+        )
+    return area
+
+
 # --- Terrain Derivatives (Copied from previous version, needed by components below) ---
 
 def get_sobel_kernels(dx, dy):
@@ -391,8 +615,8 @@ def calculate_dhdt_physics(
     h: torch.Tensor,
     U: Union[float, torch.Tensor],
     K_f: Union[float, torch.Tensor],
-    m: float,
-    n: float,
+    m: Union[float, torch.Tensor],
+    n: Union[float, torch.Tensor],
     K_d: Union[float, torch.Tensor],
     dx: float,
     dy: float,
@@ -431,23 +655,41 @@ def calculate_dhdt_physics(
     # Calculate slope magnitude
     slope_mag = calculate_slope_magnitude(h, dx, dy, padding_mode=padding_mode)
 
-    # Calculate drainage area using the IDA/D-infinity method
+    # Calculate drainage area. The legacy IDA/D-infinity path is kept for
+    # teacher-style diagnostics; soft_mfd is the differentiable training path.
     if da_params is None: da_params = {}
-    # Correctly define ida_dinf_kwargs using defaults from the simplified function signature
-    ida_dinf_kwargs = {
-        'omega': da_params.get('omega', 0.5), # Default from simpler solver
-        'solver_max_iters': da_params.get('solver_max_iters', 2000), # Default from simpler solver
-        'solver_tol': da_params.get('solver_tol', 1e-6), # Default from simpler solver
-        'eps': da_params.get('eps', 1e-10),
-        'verbose': da_params.get('verbose', False)
-    }
-    # Filter out any unexpected keys just in case da_params contains extras
-    sig = inspect.signature(calculate_drainage_area_ida_dinf_torch)
-    valid_kwargs = {k: v for k, v in ida_dinf_kwargs.items() if k in sig.parameters}
+    drainage_method = str(da_params.get('method', da_params.get('routing_method', 'ida_dinf'))).lower()
+    if drainage_method in {'soft_mfd', 'soft', 'differentiable', 'differentiable_mfd'}:
+        soft_mfd_kwargs = {
+            'num_iters': da_params.get('num_iters', da_params.get('solver_max_iters', 64)),
+            'temperature': da_params.get('temperature', 0.05),
+            'slope_power': da_params.get('slope_power', 1.0),
+            'leak_rate': da_params.get('leak_rate', 1e-3),
+            'positive_fn': da_params.get('positive_fn', 'relu'),
+            'eps': da_params.get('eps', 1e-10),
+            'max_value': da_params.get('max_value', None),
+            'verbose': da_params.get('verbose', False),
+        }
+        sig = inspect.signature(calculate_drainage_area_soft_mfd_torch)
+        valid_kwargs = {k: v for k, v in soft_mfd_kwargs.items() if k in sig.parameters}
+        drainage_area = calculate_drainage_area_soft_mfd_torch(
+            h, dx, dy, precip=precip, **valid_kwargs
+        )
+    else:
+        ida_dinf_kwargs = {
+            'omega': da_params.get('omega', 0.5), # Default from simpler solver
+            'solver_max_iters': da_params.get('solver_max_iters', 2000), # Default from simpler solver
+            'solver_tol': da_params.get('solver_tol', 1e-6), # Default from simpler solver
+            'eps': da_params.get('eps', 1e-10),
+            'verbose': da_params.get('verbose', False)
+        }
+        # Filter out any unexpected keys just in case da_params contains extras
+        sig = inspect.signature(calculate_drainage_area_ida_dinf_torch)
+        valid_kwargs = {k: v for k, v in ida_dinf_kwargs.items() if k in sig.parameters}
 
-    drainage_area = calculate_drainage_area_ida_dinf_torch(
-        h, dx, dy, precip=precip, **valid_kwargs
-    )
+        drainage_area = calculate_drainage_area_ida_dinf_torch(
+            h, dx, dy, precip=precip, **valid_kwargs
+        )
 
     # Calculate erosion rate
     erosion_rate = stream_power_erosion(h, drainage_area, slope_mag, K_f, m, n)

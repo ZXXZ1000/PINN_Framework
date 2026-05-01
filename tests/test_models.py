@@ -6,7 +6,14 @@ import numpy as np
 from unittest.mock import patch, MagicMock
 
 # 导入被测试的模块
-from src.models import AdaptiveFastscapePINN, TimeDerivativePINN
+from src.models import (
+    AdaptiveFastscapePINN,
+    LandscapeNeuralOperator,
+    LandscapeUNetPINO,
+    TimeDerivativePINN,
+    build_model_from_config,
+    cast_floating_module_dtype,
+)
 from src.utils import prepare_parameter, standardize_coordinate_system # 依赖项
 
 # --- Fixtures ---
@@ -125,6 +132,119 @@ def test_adaptive_pinn_initialization(adaptive_pinn, model_config_defaults):
     # Check default output mode
     assert adaptive_pinn.output_state is True
     assert adaptive_pinn.output_derivative is True
+
+def test_adaptive_pinn_activation_string(model_config_defaults):
+    """测试 YAML 中的字符串激活函数可以直接初始化模型。"""
+    config = model_config_defaults.copy()
+    config['activation_fn'] = 'Tanh'
+    model = AdaptiveFastscapePINN(**config)
+    assert isinstance(model.coordinate_feature_extractor[1], nn.Tanh)
+
+
+def test_landscape_unet_pino_forward_dual_output():
+    """测试新版 operator U-Net 可以吃进当前 PDE 参数并双输出。"""
+    model = LandscapeUNetPINO(hidden_channels=8, channel_multipliers=(1, 2))
+    batch_size, height, width = 2, 16, 16
+    initial_state = torch.randn(batch_size, 1, height, width)
+    model_input = {
+        'initial_state': initial_state,
+        'params': {
+            'K': torch.rand(batch_size) * 1e-5,
+            'D': torch.rand(batch_size) * 0.01,
+            'U': torch.rand(batch_size) * 1e-3,
+            'm': torch.full((batch_size,), 0.5),
+            'n': torch.full((batch_size,), 1.0),
+            'precip': torch.ones(batch_size),
+        },
+        't_target': torch.tensor([10.0, 20.0]),
+    }
+
+    outputs = model(model_input, mode='predict_state')
+
+    assert set(outputs.keys()) == {'state', 'derivative'}
+    assert outputs['state'].shape == initial_state.shape
+    assert outputs['derivative'].shape == initial_state.shape
+
+
+def test_build_model_from_config_landscape_unet():
+    """测试训练脚本可以通过 name 构造新版模型。"""
+    model = build_model_from_config({
+        'name': 'LandscapeUNetPINO',
+        'hidden_channels': 8,
+        'channel_multipliers': [1, 2],
+        'domain_x': [0.0, 10.0],
+        'domain_y': [0.0, 10.0],
+    })
+
+    assert isinstance(model, LandscapeUNetPINO)
+
+
+def test_landscape_neural_operator_forward_dual_output():
+    """测试 FNO/UNO/flow-graph operator 可以吃进当前 PDE 参数并双输出。"""
+    model = LandscapeNeuralOperator(
+        hidden_channels=8,
+        channel_multipliers=(1, 2),
+        fno_modes=(4, 4),
+        fno_layers=1,
+        flow_graph_hidden_channels=4,
+        flow_graph_iters=4,
+        domain_x=(0.0, 100.0),
+        domain_y=(0.0, 100.0),
+    )
+    batch_size, height, width = 2, 16, 16
+    initial_state = torch.randn(batch_size, 1, height, width)
+    model_input = {
+        'initial_state': initial_state,
+        'params': {
+            'K': torch.rand(batch_size) * 1e-5,
+            'D': torch.rand(batch_size) * 0.01,
+            'U': torch.rand(batch_size) * 1e-3,
+            'm': torch.full((batch_size,), 0.5),
+            'n': torch.full((batch_size,), 1.0),
+            'precip': torch.ones(batch_size),
+        },
+        't_target': torch.tensor([10.0, 20.0]),
+    }
+
+    outputs = model(model_input, mode='predict_state')
+
+    assert set(outputs.keys()) == {'state', 'derivative'}
+    assert outputs['state'].shape == initial_state.shape
+    assert outputs['derivative'].shape == initial_state.shape
+
+
+def test_build_model_from_config_landscape_neural_operator():
+    """测试训练脚本可以通过 name 构造 FNO/UNO/flow-graph operator。"""
+    model = build_model_from_config({
+        'name': 'LandscapeNeuralOperator',
+        'hidden_channels': 8,
+        'channel_multipliers': [1, 2],
+        'fno_modes': [4, 4],
+        'fno_layers': 1,
+        'flow_graph_hidden_channels': 4,
+        'flow_graph_iters': 4,
+        'domain_x': [0.0, 10.0],
+        'domain_y': [0.0, 10.0],
+    })
+
+    assert isinstance(model, LandscapeNeuralOperator)
+
+
+def test_cast_floating_module_dtype_preserves_fno_complex_weights():
+    """测试 dtype 转换不会把 FNO 的 complex 权重投成 real。"""
+    model = LandscapeNeuralOperator(
+        hidden_channels=8,
+        channel_multipliers=(1, 2),
+        fno_modes=(4, 4),
+        fno_layers=1,
+        flow_graph_hidden_channels=4,
+        flow_graph_iters=4,
+    )
+
+    cast_floating_module_dtype(model, torch.float32)
+
+    spectral_weight = model.bottleneck_fno[0].spectral.weights_pos
+    assert torch.is_complex(spectral_weight)
 
 def test_adaptive_pinn_invalid_domain():
     """测试使用无效域初始化时引发 ValueError。"""

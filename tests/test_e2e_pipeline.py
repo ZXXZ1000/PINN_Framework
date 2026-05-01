@@ -73,7 +73,7 @@ def e2e_config(temp_e2e_dirs):
             'save_interval': 1,
             'load_checkpoint': None,
             'use_mixed_precision': False,
-            'results_dir': 'PINN_Framework/results' # Explicitly set results dir relative to workspace root
+            'results_dir': str(temp_e2e_dirs['output'])
         }
     }
     # Save config to file for loading

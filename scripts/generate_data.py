@@ -15,11 +15,10 @@ import argparse
 import logging
 import numpy as np
 import torch
-import xsimlab as xs
-import fastscape # 导入 fastscape 包
 from typing import Dict, Tuple, List, Union
 import random # 新增：用于随机选择
 import multiprocessing # 新增：用于并行化
+import copy
 from functools import partial # 新增：用于并行化传递参数
 from scipy.ndimage import gaussian_filter # 新增：用于平滑噪声和高斯峰
 from omegaconf import DictConfig, ListConfig # 新增：用于处理配置对象
@@ -38,22 +37,36 @@ except ImportError:
     print("错误：无法从 src.utils 导入必要的函数。请确保你在 PINN_Framework 目录下运行此脚本，或者项目结构正确。")
     sys.exit(1)
 
-# 导入 fastscape 模型 (例如 basic_model)
-try:
-    from fastscape.models import basic_model
-except ImportError:
-    print("错误：无法导入 fastscape.models.basic_model。请确保 fastscape 已正确安装在环境中。")
-    sys.exit(1)
+_XSIMLAB = None
+_BASIC_MODEL = None
+
+
+def _load_simulation_dependencies():
+    """Load heavy Fastscape/xsimlab dependencies only when data generation runs."""
+    global _XSIMLAB, _BASIC_MODEL
+    if _XSIMLAB is not None and _BASIC_MODEL is not None:
+        return _XSIMLAB, _BASIC_MODEL
+
+    try:
+        import xsimlab as xs
+        from fastscape.models import basic_model
+    except ImportError as exc:
+        raise RuntimeError(
+            "数据生成依赖未完整安装。请安装 xsimlab、fastscape 以及 dask[distributed] 后再运行生成任务。"
+        ) from exc
+
+    _XSIMLAB = xs
+    _BASIC_MODEL = basic_model
+    return _XSIMLAB, _BASIC_MODEL
 
 
 # 尝试导入 noise 库并设置标志
 try:
-   import noise
-   HAS_NOISE_LIB = True
-   logging.info("成功导入 'noise' 库，分形噪声方法可用。")
+    import noise
+    HAS_NOISE_LIB = True
 except ImportError:
-   HAS_NOISE_LIB = False
-   logging.warning("无法导入 'noise' 库。'fractal' 方法将不可用，并回退到 'smooth_noise'。请运行 'pip install noise' 安装。")
+    noise = None
+    HAS_NOISE_LIB = False
 
 # --- 辅助函数：生成空间参数场 ---
 def generate_spatial_field(shape: Tuple[int, int], min_val: float, max_val: float, pattern: Union[str, List[str]] = 'random', **kwargs) -> np.ndarray:
@@ -70,31 +83,30 @@ def generate_spatial_field(shape: Tuple[int, int], min_val: float, max_val: floa
         生成的空间参数场 (numpy array).
     """
     # 如果 pattern 是列表，随机选择一个
-    print(f"DEBUG: 处理模式参数: {pattern}, 类型: {type(pattern)}")
+    logging.debug(f"处理模式参数: {pattern}, 类型: {type(pattern)}")
 
     # 处理不同类型的模式参数
     # 首先检查是否为 ListConfig，如果是，转换为 Python 列表
     if isinstance(pattern, ListConfig):
-        print(f"DEBUG: pattern 是 ListConfig，转换为 list: {list(pattern)}")
+        logging.debug(f"pattern 是 ListConfig，转换为 list: {list(pattern)}")
         pattern = list(pattern) # 转换为标准列表以便后续处理
 
     if isinstance(pattern, (list, tuple)):
         pattern_list = list(pattern) # 确保是列表
-        print(f"DEBUG: 处理列表/元组模式: {pattern_list}")
+        logging.debug(f"处理列表/元组模式: {pattern_list}")
         if all(isinstance(p, str) for p in pattern_list):
             chosen_pattern = random.choice(pattern_list)
-            print(f"DEBUG: 从列表中随机选择模式: '{chosen_pattern}'")
             logging.debug(f"从列表 {pattern_list} 中随机选择模式: '{chosen_pattern}'")
         else:
             logging.warning(f"pattern 列表元素类型异常: {pattern_list}，将使用 'random'。")
             chosen_pattern = 'random'
     elif isinstance(pattern, str):
         chosen_pattern = pattern
-        print(f"DEBUG: 使用字符串模式: '{chosen_pattern}'")
+        logging.debug(f"使用字符串模式: '{chosen_pattern}'")
     else:
         # 处理其他无法识别的类型
         pattern_type = type(pattern).__name__
-        print(f"DEBUG: 模式类型不是 ListConfig、列表、元组或字符串，而是 {pattern_type}")
+        logging.debug(f"模式类型不是 ListConfig、列表、元组或字符串，而是 {pattern_type}")
         logging.warning(f"pattern 类型异常: {pattern} (类型: {pattern_type})，将使用 'random'。")
         chosen_pattern = 'random'
 
@@ -232,22 +244,22 @@ def sample_scalar_parameters(param_ranges: Dict[str, Union[List[float], float]])
     }
 
     # 打印调试信息
-    print(f"DEBUG: 参数范围配置: {param_ranges}")
+    logging.debug(f"参数范围配置: {param_ranges}")
 
     for key, default_range in default_scalar_ranges.items():
         current_range_config = param_ranges.get(key, default_range)
 
         # 打印调试信息
-        print(f"DEBUG: 处理参数 '{key}', 原始范围配置: {current_range_config}, 类型: {type(current_range_config)}")
+        logging.debug(f"处理参数 '{key}', 原始范围配置: {current_range_config}, 类型: {type(current_range_config)}")
 
         # 首先检查是否为 ListConfig，如果是，转换为 Python 列表
         if isinstance(current_range_config, ListConfig):
-            print(f"DEBUG: '{key}' 的范围是 ListConfig，转换为 list: {list(current_range_config)}")
+            logging.debug(f"'{key}' 的范围是 ListConfig，转换为 list: {list(current_range_config)}")
             current_range = list(current_range_config) # 转换为标准列表
         else:
             current_range = current_range_config # 保持原样
 
-        print(f"DEBUG: 处理参数 '{key}', 转换后范围: {current_range}, 类型: {type(current_range)}")
+        logging.debug(f"处理参数 '{key}', 转换后范围: {current_range}, 类型: {type(current_range)}")
 
         # 支持字典格式（如{"min": x, "max": y}），以及常规的list/tuple/float/int
         if isinstance(current_range, dict):
@@ -256,7 +268,7 @@ def sample_scalar_parameters(param_ranges: Dict[str, Union[List[float], float]])
             try:
                 min_val = float(min_val)
                 max_val = float(max_val)
-                print(f"DEBUG: 从字典提取的范围: [{min_val}, {max_val}]")
+                logging.debug(f"从字典提取的范围: [{min_val}, {max_val}]")
             except Exception as e:
                 logging.warning(f"标量参数 '{key}' 的字典范围值无法转换为float: {current_range} ({e})，使用默认范围 {default_range}。")
                 min_val, max_val = default_range
@@ -269,7 +281,7 @@ def sample_scalar_parameters(param_ranges: Dict[str, Union[List[float], float]])
                 # 确保列表元素是浮点数
                 min_val = float(current_range[0])
                 max_val = float(current_range[1])
-                print(f"DEBUG: 从列表/元组提取的范围: [{min_val}, {max_val}]")
+                logging.debug(f"从列表/元组提取的范围: [{min_val}, {max_val}]")
                 if abs(min_val - max_val) < 1e-9:
                     sampled_params[key] = float(min_val)
                 else:
@@ -283,7 +295,7 @@ def sample_scalar_parameters(param_ranges: Dict[str, Union[List[float], float]])
                     sampled_params[key] = np.random.uniform(min_val, max_val)
         elif isinstance(current_range, (int, float)):
             sampled_params[key] = float(current_range)
-            print(f"DEBUG: 使用固定值: {sampled_params[key]}")
+            logging.debug(f"使用固定值: {sampled_params[key]}")
         else:
             logging.warning(f"标量参数 '{key}' 的范围格式无效: {current_range} (类型: {type(current_range)})。使用默认范围 {default_range}。")
             min_val, max_val = default_range
@@ -292,7 +304,6 @@ def sample_scalar_parameters(param_ranges: Dict[str, Union[List[float], float]])
             else:
                 sampled_params[key] = np.random.uniform(min_val, max_val)
 
-    print(f"DEBUG: 最终采样的参数: {sampled_params}")
     logging.debug(f"采样的标量参数 (最终): {sampled_params}")
     return sampled_params
 
@@ -424,28 +435,27 @@ def generate_initial_topography(shape: Tuple[int, int], method: Union[str, List[
     # --- 结束新增 ---
 
     # 如果 method 是列表，随机选择一个
-    print(f"DEBUG: 处理初始地形方法参数: {method}, 类型: {type(method)}")
+    logging.debug(f"处理初始地形方法参数: {method}, 类型: {type(method)}")
 
     # 处理不同类型的方法参数
     if isinstance(method, (list, tuple)):
         # 将列表转换为标准Python列表
         method_list = list(method)
-        print(f"DEBUG: 将方法转换为列表: {method_list}")
+        logging.debug(f"将方法转换为列表: {method_list}")
 
         if all(isinstance(m, str) for m in method_list):
             chosen_method = random.choice(method_list)
-            print(f"DEBUG: 从列表中随机选择初始地形方法: '{chosen_method}'")
             logging.debug(f"从列表 {method_list} 中随机选择初始地形方法: '{chosen_method}'")
         else:
             logging.warning(f"初始地形方法列表元素类型异常: {method_list}，将使用 'flat'。")
             chosen_method = 'flat'
     elif isinstance(method, str):
         chosen_method = method
-        print(f"DEBUG: 使用字符串初始地形方法: '{chosen_method}'")
+        logging.debug(f"使用字符串初始地形方法: '{chosen_method}'")
     else:
         # 处理其他类型
         method_type = type(method).__name__
-        print(f"DEBUG: 方法类型不是列表或字符串，而是 {method_type}")
+        logging.debug(f"方法类型不是列表或字符串，而是 {method_type}")
         logging.warning(f"初始地形方法类型异常: {method} (类型: {method_type})，将使用 'flat'。")
         chosen_method = 'flat'
 
@@ -628,14 +638,6 @@ def generate_single_sample_worker(sample_index: int, config: Dict) -> bool:
         # 如果没有基础种子，依赖系统为每个进程提供的不同状态
         logging.debug(f"样本 {sample_index+1}: 未设置特定随机种子")
 
-    # 使用 OmegaConf 访问配置，提供默认值
-    try:
-        from omegaconf import OmegaConf
-        if not isinstance(config, OmegaConf): # Ensure it's OmegaConf object for easy access
-             config = OmegaConf.create(config)
-    except ImportError:
-        logging.warning("OmegaConf 未安装，使用标准字典访问，可能缺少默认值处理。")
-
     data_gen_config = config.get('data_generation', {}) # Use .get for safety
     sim_config = data_gen_config.get('simulation_params', {})
     parameter_type = data_gen_config.get('parameter_type', 'scalar').lower()
@@ -741,6 +743,8 @@ def generate_single_sample_worker(sample_index: int, config: Dict) -> bool:
 
     logging.info(f"--- [Worker {os.getpid()}] 正在生成样本 {sample_index+1}，形状 {grid_shape} ---")
     try:
+        xs, basic_model = _load_simulation_dependencies()
+
         # 1. 生成/采样参数
         final_params = sample_scalar_parameters(scalar_param_ranges)
         if parameter_type == 'spatial':
@@ -758,19 +762,19 @@ def generate_single_sample_worker(sample_index: int, config: Dict) -> bool:
                           if k not in ['pattern', 'min', 'max']
                       }
                       # 直接将pattern传递给generate_spatial_field函数，该函数已经能够处理列表或字符串模式
-                      print(f"[Worker {os.getpid()} Sample {sample_index+1} DBG] 生成空间场: key={key}, min={min_val}, max={max_val}, pattern='{pattern}', kwargs={pattern_kwargs}")
+                      logging.debug(f"[Worker {os.getpid()} Sample {sample_index+1}] 生成空间场: key={key}, min={min_val}, max={max_val}, pattern='{pattern}', kwargs={pattern_kwargs}")
                       try:
                           # Debug print grid_shape before generating spatial field
-                          print(f"[Worker {os.getpid()} Sample {sample_index+1}] 空间场生成前的 grid_shape: {grid_shape}, 类型: {type(grid_shape)}")
+                          logging.debug(f"[Worker {os.getpid()} Sample {sample_index+1}] 空间场生成前的 grid_shape: {grid_shape}, 类型: {type(grid_shape)}")
                           spatial_params[key] = generate_spatial_field(grid_shape, min_val, max_val, pattern, **pattern_kwargs)
                           # Debug print the shape of the generated field
                           field_shape = spatial_params[key].shape
-                          print(f"[Worker {os.getpid()} Sample {sample_index+1} DBG] 为 '{key}' 生成了空间场。形状: {field_shape}")
+                          logging.debug(f"[Worker {os.getpid()} Sample {sample_index+1}] 为 '{key}' 生成了空间场。形状: {field_shape}")
                       except Exception as e:
-                          print(f"[Worker {os.getpid()} Sample {sample_index+1}] 错误: 生成 '{key}' 的空间场时出错: {e}")
+                          logging.error(f"[Worker {os.getpid()} Sample {sample_index+1}] 生成 '{key}' 的空间场时出错: {e}")
                           # Create a default constant field as fallback
                           spatial_params[key] = np.full(grid_shape, (min_val + max_val) / 2, dtype=np.float32)
-                          print(f"[Worker {os.getpid()} Sample {sample_index+1}] 已创建默认常量场作为回退。")
+                          logging.warning(f"[Worker {os.getpid()} Sample {sample_index+1}] 已创建默认常量场作为回退。")
                  else:
                       logging.debug(f"未找到空间参数 '{key}' 的配置。将保持标量。")
             final_params.update(spatial_params)
@@ -854,12 +858,26 @@ def generate_single_sample_worker(sample_index: int, config: Dict) -> bool:
         # 提取最终地形 - 使用最后一个时间点
         final_topo_xr = out_ds['topography__elevation'].isel(out=-1)
         final_topo_tensor = torch.from_numpy(final_topo_xr.values.astype(np.float32)).unsqueeze(0)
+        trajectory_np = out_ds['topography__elevation'].values.astype(np.float32)
+        if trajectory_np.ndim == 3:
+            trajectory_tensor = torch.from_numpy(trajectory_np).unsqueeze(1)
+        else:
+            trajectory_tensor = torch.from_numpy(trajectory_np)
+        time_values = np.asarray(out_ds['out'].values, dtype=np.float32)
+        time_tensor = torch.from_numpy(time_values)
+        if len(time_values) >= 2:
+            dt_tensor = torch.tensor(float(np.mean(np.diff(time_values))), dtype=torch.float32)
+        else:
+            dt_tensor = torch.tensor(float(run_time_total), dtype=torch.float32)
 
         # 准备保存的字典
         sample_output = {
             'initial_topo': initial_topo_tensor, # 使用我们生成的初始地形
             'final_topo': final_topo_tensor,
-            'run_time': torch.tensor(run_time_total, dtype=torch.float32)
+            'trajectory_topo': trajectory_tensor,
+            'time': time_tensor,
+            'run_time': torch.tensor(run_time_total, dtype=torch.float32),
+            'dt': dt_tensor,
         }
         # 添加参数
         param_mapping = {
@@ -888,11 +906,6 @@ def generate_single_sample_worker(sample_index: int, config: Dict) -> bool:
 # --- 辅助函数：生成特定分辨率的数据集 (修改为并行) ---
 def generate_dataset_for_resolution(config: Dict):
     """为特定配置（分辨率）生成数据集，支持并行化。"""
-    try:
-        from omegaconf import OmegaConf
-        if not isinstance(config, OmegaConf): config = OmegaConf.create(config)
-    except ImportError: pass
-
     data_gen_config = config.get('data_generation', {})
     num_samples = data_gen_config.get('num_samples', 10)
     output_dir = data_gen_config.get('output_dir')
@@ -963,18 +976,18 @@ def main(args):
         print(f"错误：无法加载配置文件 {args.config}: {e}")
         sys.exit(1)
 
-    # 使用 OmegaConf 访问配置，提供默认值
-    try:
-        from omegaconf import OmegaConf
-        if not isinstance(config, OmegaConf): config = OmegaConf.create(config)
-    except ImportError: pass # 继续使用字典访问
-
     log_config = config.get('logging', {})
     log_dir = log_config.get('log_dir', 'logs/data_generation')
     log_filename = log_config.get('log_filename', 'generate_data.log')
     log_file_path = os.path.join(log_dir, log_filename) if log_dir and log_filename else None
     log_level = log_config.get('log_level', 'INFO')
     setup_logging(log_level=log_level, log_file=log_file_path, log_to_console=True)
+
+    try:
+        _load_simulation_dependencies()
+    except RuntimeError as e:
+        logging.error(e)
+        sys.exit(1)
 
     base_data_gen_config = config.get('data_generation', {})
     base_output_dir = base_data_gen_config.get('base_output_dir', 'data/processed') # 使用 base_output_dir
@@ -993,12 +1006,7 @@ def main(args):
         logging.info(f"--- 处理分辨率: {height}x{width} ---")
 
         # 创建此分辨率的特定配置副本
-        try:
-            from omegaconf import OmegaConf
-            res_config = OmegaConf.create(OmegaConf.to_container(config, resolve=False)) # 创建可修改副本
-        except ImportError:
-             import copy
-             res_config = copy.deepcopy(config) # Fallback
+        res_config = copy.deepcopy(config)
 
         # 确保 data_generation 部分存在且可修改
         if 'data_generation' not in res_config: res_config['data_generation'] = {}
@@ -1021,25 +1029,8 @@ def main(args):
 
 
 if __name__ == "__main__":
-    # 内置配置文件路径，不再需要通过命令行参数指定
-    config_path = os.path.join(project_root, 'configs', 'data_gen_config.yaml')
-    print(f"使用内置配置文件路径: {config_path}")
-
-    # 检查配置文件是否存在
-    if not os.path.exists(config_path):
-        print(f"错误: 配置文件不存在: {config_path}")
-        sys.exit(1)
-
-    # 创建一个类似于命令行参数的对象
-    class Args:
-        def __init__(self):
-            self.config = config_path
-
-    args = Args()
+    default_config_path = os.path.join(project_root, 'configs', 'data_gen_config.yaml')
+    parser = argparse.ArgumentParser(description="使用 Fastscape 生成训练数据。")
+    parser.add_argument('--config', type=str, default=default_config_path, help='配置文件的路径。')
+    args = parser.parse_args()
     main(args)
-
-    # 保留原始命令行参数处理，以便在需要时可以覆盖内置路径
-    # parser = argparse.ArgumentParser(description="使用 Fastscape 生成训练数据。")
-    # parser.add_argument('--config', type=str, default=config_path, help='配置文件的路径。')
-    # args = parser.parse_args()
-    # main(args)

@@ -48,12 +48,6 @@ def load_target_dem(filepath: str, device: torch.device, dtype: torch.dtype) -> 
 
 def load_fixed_inputs(config: Dict, target_shape: Tuple[int, int], device: torch.device, dtype: torch.dtype) -> Dict[str, Any]:
     """加载配置中指定的固定输入（例如，initial_topo, K, D）。"""
-    # 使用 OmegaConf 安全访问嵌套字典
-    try:
-        from omegaconf import OmegaConf
-        if not isinstance(config, OmegaConf): config = OmegaConf.create(config)
-    except ImportError: pass # 继续使用字典访问
-
     fixed_input_paths = config.get('fixed_inputs', {})
     inputs = {}
     logging.info("正在加载固定输入...")
@@ -100,12 +94,6 @@ def load_fixed_inputs(config: Dict, target_shape: Tuple[int, int], device: torch
 
 def prepare_initial_param_guess(config: Dict, target_shape: Tuple[int, int], device: torch.device, dtype: torch.dtype) -> Dict[str, torch.Tensor]:
     """准备待优化参数的初始猜测值。"""
-    # 使用 OmegaConf 安全访问嵌套字典
-    try:
-        from omegaconf import OmegaConf
-        if not isinstance(config, OmegaConf): config = OmegaConf.create(config)
-    except ImportError: pass # 继续使用字典访问
-
     params_to_optimize_config = config.get('parameters_to_optimize', {})
     initial_params = {}
     target_h, target_w = target_shape
@@ -175,10 +163,8 @@ def main(args):
         print(f"错误：无法加载配置文件 {args.config}: {e}")
         sys.exit(1)
 
-    # 使用 OmegaConf 访问配置
     try:
         from omegaconf import OmegaConf
-        if not isinstance(config, OmegaConf): config = OmegaConf.create(config)
     except ImportError: pass # 继续使用字典
 
     opt_config = config.get('optimization', {})
@@ -212,7 +198,7 @@ def main(args):
 
     try:
         # 确保传递给模型的配置是标准字典
-        model_args_dict = OmegaConf.to_container(model_args, resolve=True) if 'OmegaConf' in locals() and isinstance(model_args, OmegaConf) else model_args
+        model_args_dict = OmegaConf.to_container(model_args, resolve=True) if 'OmegaConf' in locals() and OmegaConf.is_config(model_args) else model_args
         model = AdaptiveFastscapePINN(**model_args_dict).to(dtype=model_dtype)
     except Exception as e:
         logging.error(f"初始化 AdaptiveFastscapePINN 模型失败: {e}", exc_info=True)
@@ -253,7 +239,7 @@ def main(args):
          logging.error("未在优化配置中找到 'parameters_to_optimize' 部分。")
          sys.exit(1)
     # 将 OmegaConf 列表/字典转换为标准 Python 类型
-    params_to_optimize_config_dict = OmegaConf.to_container(params_to_optimize_config, resolve=True) if 'OmegaConf' in locals() and isinstance(params_to_optimize_config, OmegaConf) else params_to_optimize_config
+    params_to_optimize_config_dict = OmegaConf.to_container(params_to_optimize_config, resolve=True) if 'OmegaConf' in locals() and OmegaConf.is_config(params_to_optimize_config) else params_to_optimize_config
 
     initial_params_guess = prepare_initial_param_guess(opt_config, target_dem_shape, device, model_dtype)
 
@@ -271,7 +257,7 @@ def main(args):
     # 确保优化配置包含保存路径
     opt_params_config = config.get('optimization_params', {}) # 获取优化参数子配置
     # 将 OmegaConf 转为字典以进行修改
-    if 'OmegaConf' in locals() and isinstance(opt_params_config, OmegaConf):
+    if 'OmegaConf' in locals() and OmegaConf.is_config(opt_params_config):
          opt_params_config = OmegaConf.to_container(opt_params_config, resolve=True)
 
     opt_params_config['save_path'] = os.path.join(opt_output_dir, opt_params_config.get('output_filename', 'optimized_params.pth'))

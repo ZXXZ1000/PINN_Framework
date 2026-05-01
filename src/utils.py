@@ -5,6 +5,7 @@
 
 import os
 import sys
+import copy
 import logging
 import random
 import numpy as np
@@ -12,6 +13,7 @@ import torch
 import yaml
 from omegaconf import OmegaConf # Using OmegaConf for config loading
 import time
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Optional, Tuple, Any, Union, List, Callable
 
@@ -101,19 +103,68 @@ def save_data_sample(data_dict: Dict, filepath: str):
     except Exception as e:
         logging.error(f"保存文件 {filepath} 时出错: {e}")
 
+def _register_config_resolvers():
+    """Register the small set of OmegaConf resolvers used by local YAML configs."""
+    try:
+        if not OmegaConf.has_resolver("now"):
+            OmegaConf.register_new_resolver("now", lambda fmt: datetime.now().strftime(fmt))
+        if not OmegaConf.has_resolver("eval"):
+            OmegaConf.register_new_resolver("eval", lambda expr: eval(expr, {"__builtins__": {}}, {}))
+    except Exception as e:
+        logging.warning(f"无法注册 OmegaConf resolver: {e}")
+
+
 def load_config(config_path: str) -> Union[Dict, OmegaConf]:
     """使用 OmegaConf 加载 YAML 配置文件。"""
     try:
+        _register_config_resolvers()
         conf = OmegaConf.load(config_path)
         logging.info(f"已使用 OmegaConf 从 {config_path} 加载配置")
-        # 返回 OmegaConf 对象，允许插值和访问属性
-        return OmegaConf.to_container(conf, resolve=False)
+        return OmegaConf.to_container(conf, resolve=True)
     except FileNotFoundError:
         logging.error(f"配置文件未找到: {config_path}")
         raise
     except Exception as e:
         logging.error(f"加载配置文件 {config_path} 时出错: {e}")
         raise
+
+def normalize_training_config(config: Union[Dict, OmegaConf]) -> Dict:
+    """
+    Normalize legacy top-level run settings into the training section.
+
+    The repository YAML files historically put run-level fields such as
+    output_dir, run_name, seed, and run_options.device at the root, while
+    PINNTrainer reads most of them from config["training"]. This function makes
+    that contract explicit and keeps existing configs backward-compatible.
+    """
+    if OmegaConf.is_config(config):
+        config_dict = OmegaConf.to_container(config, resolve=True)
+    elif isinstance(config, dict):
+        config_dict = copy.deepcopy(config)
+    else:
+        raise TypeError(f"Unsupported config type: {type(config)}")
+
+    training = config_dict.setdefault('training', {})
+    run_options = config_dict.get('run_options', {}) or {}
+
+    if 'results_dir' not in training:
+        training['results_dir'] = config_dict.get('output_dir', 'results')
+
+    if 'run_name' not in training and config_dict.get('run_name') is not None:
+        training['run_name'] = config_dict['run_name']
+    training.setdefault('run_name', 'pinn_run')
+
+    if 'seed' not in training and config_dict.get('seed') is not None:
+        training['seed'] = config_dict['seed']
+
+    if 'device' not in training and run_options.get('device') is not None:
+        training['device'] = run_options['device']
+    training.setdefault('device', 'auto')
+
+    if 'save_interval' not in training and training.get('checkpoint_freq') is not None:
+        training['save_interval'] = training['checkpoint_freq']
+
+    return config_dict
 
 def save_config(config: Union[Dict, OmegaConf], filepath: str):
     """将配置字典或 OmegaConf 对象保存到 YAML 文件。"""

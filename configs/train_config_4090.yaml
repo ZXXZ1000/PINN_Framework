@@ -11,6 +11,7 @@ run_options:
 # --- 数据设置 ---
 data:
   processed_dir: data/processed
+  sample_mode: pair
   train_split: 0.8
   val_split: 0.1
   num_workers: 8                # 充分利用CPU多核，提高数据加载效率
@@ -88,6 +89,8 @@ training:
     eta_min: 1e-7
   loss_weights:
     data: 1.0
+    increment: 0.5
+    derivative_data: 0.1
     physics: 0.1
     smoothness: 0.001
   clip_grad_norm: 1.0

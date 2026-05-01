@@ -1,104 +1,137 @@
 # PINN_Framework 安装指南
 
-本文档提供了安装和设置 PINN_Framework 环境的详细步骤。
+这份安装说明只覆盖“把项目带到一台新宿主机后如何跑起来”。完整训练流程见 [RUNBOOK.md](RUNBOOK.md)。
 
-## 系统要求
+## 推荐方式
 
-- Python 3.10 或更高版本
-- Conda 包管理器 (推荐使用 [Miniconda](https://docs.conda.io/en/latest/miniconda.html) 或 [Anaconda](https://www.anaconda.com/download/))
-- 对于 GPU 加速 (可选): CUDA 兼容的 NVIDIA GPU
-
-## 安装步骤
-
-### 1. 克隆代码库
+在仓库根目录运行：
 
 ```bash
-git clone <repository-url>
-cd PINN_Framework
-```
-
-### 2. 创建并激活 Conda 环境
-
-我们提供了 `environment.yml` 文件，其中包含了所有必要的依赖项。
-
-```bash
-# 创建环境
-conda env create -f environment.yml
-
-# 激活环境
+bash scripts/setup_environment.sh
 conda activate pinn-framework-env
 ```
 
-### 3. 安装额外的开发/测试依赖项 (可选)
+这个脚本会：
 
-如果你需要进行开发或运行测试，可以安装额外的依赖项：
-
-```bash
-pip install -r requirements.txt
+```text
+1. 根据 environment.yml 创建或更新 pinn-framework-env
+2. 运行 scripts/check_environment.py 检查核心依赖
+3. 默认运行一次 operator smoke training
 ```
 
-### 4. 验证安装
-
-运行以下命令验证环境是否正确设置：
+如果只想装环境，不想跑 smoke training：
 
 ```bash
-# 检查 PyTorch 是否可用
-python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
-
-# 检查 Fastscape 是否可用
-python -c "import fastscape; print(f'Fastscape version: {fastscape.__version__}')"
-
-# 检查 xarray 和 xsimlab 是否可用
-python -c "import xarray as xr, xsimlab as xs; print(f'xarray version: {xr.__version__}, xsimlab version: {xs.__version__}')"
+PINN_SKIP_SMOKE=1 bash scripts/setup_environment.sh
+conda activate pinn-framework-env
+python scripts/check_environment.py
 ```
 
-## GPU 支持 (可选)
+## 手动安装
 
-默认情况下，环境配置为使用 CPU 版本的 PyTorch。如果你想使用 GPU 加速，请按照以下步骤操作：
+```bash
+conda env create -f environment.yml
+conda activate pinn-framework-env
+python scripts/check_environment.py --smoke
+```
 
-1. 编辑 `environment.yml` 文件：
-   - 删除或注释掉 `- cpuonly` 行
-   - 取消注释 `# - pytorch-cuda=11.8` 行，并根据你的 CUDA 版本进行调整
+如果环境已存在：
 
-2. 创建新的环境或更新现有环境：
-   ```bash
-   # 创建新环境
-   conda env create -f environment.yml
-   
-   # 或更新现有环境
-   conda env update -f environment.yml
-   ```
+```bash
+conda env update -n pinn-framework-env -f environment.yml --prune
+conda activate pinn-framework-env
+python scripts/check_environment.py --smoke
+```
 
-3. 验证 GPU 是否可用：
-   ```bash
-   python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}, Device count: {torch.cuda.device_count()}')"
-   ```
+## 验收
+
+环境和代码基础验收：
+
+```bash
+python scripts/check_environment.py --smoke
+pytest -q
+```
+
+通过时应看到：
+
+```text
+Environment check passed.
+operator training verification passed.
+pytest: all tests passed
+```
+
+## 训练入口
+
+生成数据：
+
+```bash
+python scripts/generate_data.py --config configs/data_gen_config.yaml
+```
+
+训练默认 LandscapeNeuralOperator：
+
+```bash
+python scripts/train_operator.py --config configs/train_operator_config.yaml
+```
+
+训练输出默认在：
+
+```text
+results/<run_name>/
+  checkpoints/
+  logs/
+  tensorboard/
+```
+
+不应该输出到：
+
+```text
+PINN_Framework/results/
+```
+
+## 验证入口
+
+单步验证：
+
+```bash
+python scripts/evaluate_operator.py \
+  --config configs/train_operator_config.yaml \
+  --checkpoint results/<run_name>/checkpoints/best_model.pth \
+  --split val \
+  --output results/<run_name>/evaluation_val.json
+```
+
+多步 rollout 验证：
+
+```bash
+python scripts/evaluate_rollout.py \
+  --config configs/train_operator_config.yaml \
+  --checkpoint results/<run_name>/checkpoints/best_model.pth \
+  --split val \
+  --steps 10 \
+  --output results/<run_name>/rollout_val.json
+```
 
 ## 常见问题
 
-### Fastscape 安装问题
+### 默认 python 没有 torch
 
-Fastscape 依赖于 Fortran 编译器。如果安装过程中遇到与 Fastscape 相关的错误，请确保系统上安装了适当的 Fortran 编译器：
-
-- **Windows**: 安装 MinGW-w64 with gfortran
-- **Linux**: 安装 gfortran (`sudo apt-get install gfortran` 或类似命令)
-- **macOS**: 使用 Homebrew 安装 gfortran (`brew install gcc`)
-
-### PyTorch 版本问题
-
-如果你需要特定版本的 PyTorch，可以在创建环境后手动安装：
+请先激活 conda 环境：
 
 ```bash
-# 激活环境
 conda activate pinn-framework-env
-
-# 安装特定版本的 PyTorch (示例)
-pip install torch==2.0.0 torchvision==0.15.0
+python scripts/check_environment.py
 ```
 
-## 其他资源
+### Fastscape/xsimlab 导入失败
 
-- [PyTorch 安装指南](https://pytorch.org/get-started/locally/)
-- [Fastscape 文档](https://fastscape.readthedocs.io/)
-- [xarray 文档](https://docs.xarray.dev/en/stable/)
-- [xsimlab 文档](https://xsimlab.readthedocs.io/)
+通常是 `distributed`、`xsimlab`、`fastscape` 或 `netCDF4` 缺失。运行：
+
+```bash
+python scripts/check_environment.py
+conda env update -n pinn-framework-env -f environment.yml --prune
+```
+
+### Mac 可以跑吗
+
+Mac 可以跑 smoke test 和小规模调试。正式大规模训练建议用 4090 或服务器。

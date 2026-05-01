@@ -13,7 +13,9 @@ from src.physics import (
     stream_power_erosion,
     hillslope_diffusion,
     calculate_dhdt_physics,
-    calculate_drainage_area_ida_dinf_torch
+    calculate_drainage_area_ida_dinf_torch,
+    calculate_drainage_area_soft_mfd_torch,
+    calculate_soft_mfd_flow_weights,
 )
 
 # --- Fixtures ---
@@ -211,6 +213,102 @@ def test_calculate_drainage_area_simple_ramp(rows, cols, grid_params, drainage_a
     # The current implementation doesn't conserve total precipitation perfectly
     # Just check that the total is within a reasonable range
     assert da.sum() > 0.5 * total_area
+
+
+def test_calculate_drainage_area_batch_two(grid_params):
+    """测试 D∞ 权重计算支持 batch size > 1。"""
+    dx, dy = grid_params['dx'], grid_params['dy']
+    h_ramp = create_ramp_topo(4, 4, dx, dy).float().repeat(2, 1, 1, 1)
+    da = calculate_drainage_area_ida_dinf_torch(
+        h_ramp,
+        dx,
+        dy,
+        precip=1.0,
+        omega=0.3,
+        solver_max_iters=5,
+        solver_tol=1e-4,
+        eps=1e-9,
+        verbose=False,
+    )
+
+    assert da.shape == h_ramp.shape
+    assert torch.all(torch.isfinite(da))
+    assert torch.all(da >= 0)
+
+
+def test_calculate_drainage_area_soft_mfd_is_differentiable(grid_params):
+    """测试 soft-MFD 汇水面积能把梯度传回地形。"""
+    dx, dy = grid_params['dx'], grid_params['dy']
+    h_ramp = create_ramp_topo(5, 5, dx, dy).float().requires_grad_(True)
+
+    da = calculate_drainage_area_soft_mfd_torch(
+        h_ramp,
+        dx,
+        dy,
+        precip=1.0,
+        num_iters=8,
+        temperature=0.05,
+        slope_power=1.0,
+        leak_rate=1e-3,
+        positive_fn='relu',
+    )
+    loss = da.square().mean()
+    loss.backward()
+
+    assert da.shape == h_ramp.shape
+    assert torch.all(torch.isfinite(da))
+    assert h_ramp.grad is not None
+    assert torch.all(torch.isfinite(h_ramp.grad))
+    assert torch.any(torch.abs(h_ramp.grad) > 0)
+
+
+def test_soft_mfd_flow_weights_are_bounded(grid_params):
+    """测试 soft flow graph 的每个源像元出流比例不超过 1。"""
+    dx, dy = grid_params['dx'], grid_params['dy']
+    h_ramp = create_ramp_topo(5, 5, dx, dy).float()
+
+    weights = calculate_soft_mfd_flow_weights(
+        h_ramp,
+        dx,
+        dy,
+        temperature=0.05,
+        leak_rate=1e-3,
+    )
+
+    assert weights.shape == (1, 8, 5, 5)
+    assert torch.all(torch.isfinite(weights))
+    assert torch.all(weights >= 0)
+    assert torch.all(weights.sum(dim=1) <= 1.0 + 1e-6)
+
+
+def test_calculate_dhdt_physics_can_use_soft_mfd(grid_params, physics_params):
+    """测试 PDE RHS 可以通过 da_params 切到可微 soft-MFD 汇水面积。"""
+    dx, dy = grid_params['dx'], grid_params['dy']
+    h_ramp = create_ramp_topo(5, 5, dx, dy).float().requires_grad_(True)
+
+    dhdt = calculate_dhdt_physics(
+        h=h_ramp,
+        U=physics_params['U'],
+        K_f=physics_params['K_f'],
+        m=physics_params['m'],
+        n=physics_params['n'],
+        K_d=physics_params['K_d'],
+        dx=dx,
+        dy=dy,
+        precip=physics_params['precip'],
+        da_params={
+            'method': 'soft_mfd',
+            'num_iters': 8,
+            'temperature': 0.05,
+            'leak_rate': 1e-3,
+        },
+    )
+    dhdt.mean().backward()
+
+    assert dhdt.shape == h_ramp.shape
+    assert torch.all(torch.isfinite(dhdt))
+    assert h_ramp.grad is not None
+    assert torch.all(torch.isfinite(h_ramp.grad))
 
 def test_calculate_drainage_area_precip_tensor(grid_params, drainage_area_params):
     """测试使用张量形式的降水输入。"""

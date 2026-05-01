@@ -4,7 +4,12 @@
 """
 
 import os
+import tempfile
 import logging
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "pinn_framework_matplotlib"))
+os.environ.setdefault("XDG_CACHE_HOME", os.path.join(tempfile.gettempdir(), "pinn_framework_cache"))
+os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
+os.makedirs(os.environ["XDG_CACHE_HOME"], exist_ok=True)
 import torch
 import numpy as np
 import torch.optim as optim
@@ -18,7 +23,7 @@ from typing import Dict, Optional, Tuple, Any
 try:
     from .models import AdaptiveFastscapePINN, TimeDerivativePINN # Main model and base class
     from .losses import compute_total_loss, compute_pde_residual_dual_output # Main loss functions
-    from .utils import set_seed, get_device # Assuming utils.py exists
+    from .utils import set_seed, get_device, normalize_training_config # Assuming utils.py exists
 except ImportError as e:
     logging.error(f"Failed to import necessary components: {e}. Ensure models.py, losses.py, utils.py exist.")
     # Define placeholders to allow module loading but fail at runtime
@@ -28,6 +33,7 @@ except ImportError as e:
     def compute_pde_residual_dual_output(*args, **kwargs): raise NotImplementedError("compute_pde_residual_dual_output not imported")
     def set_seed(*args, **kwargs): pass
     def get_device(*args, **kwargs): return torch.device('cpu')
+    def normalize_training_config(config): return config
 
 
 class DynamicWeightScheduler:
@@ -53,12 +59,10 @@ class PINNTrainer:
             train_loader: Training data loader.
             val_loader: Validation data loader (optional).
         """
-        if not isinstance(model, AdaptiveFastscapePINN):
-             # Although we expect AdaptiveFastscapePINN, check base class for safety
-             if not isinstance(model, TimeDerivativePINN):
-                 raise TypeError(f"Model must be an instance of AdaptiveFastscapePINN or TimeDerivativePINN, got {type(model)}")
-             else:
-                  logging.warning(f"Received model of type {type(model)}, expected AdaptiveFastscapePINN. Proceeding, but ensure compatibility.")
+        if not isinstance(model, TimeDerivativePINN):
+            raise TypeError(f"Model must be an instance of TimeDerivativePINN, got {type(model)}")
+
+        config = normalize_training_config(config)
 
         self.model = model
         self.train_loader = train_loader
@@ -159,7 +163,7 @@ class PINNTrainer:
         elif scheduler_type == 'plateau':
             patience = scheduler_config.get('patience', 10)
             factor = scheduler_config.get('factor', 0.1)
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=factor, patience=patience, verbose=False)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=factor, patience=patience)
             logging.info(f"Using ReduceLROnPlateau scheduler: patience={patience}, factor={factor}")
         elif scheduler_type == 'cosine':
             t_max = scheduler_config.get('t_max', self.max_epochs)
@@ -173,6 +177,30 @@ class PINNTrainer:
             logging.warning(f"Unknown scheduler type: {scheduler_type}. No scheduler used.")
             scheduler = None
         return scheduler
+
+    def _build_physics_params_for_loss(self, params_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Build per-batch physics parameters for the PDE residual."""
+        physics_params_for_loss = self.physics_params.copy()
+        param_mapping = {
+            'U': 'U',
+            'K_f': 'K',
+            'K_d': 'D',
+            'm': 'm',
+            'n': 'n',
+        }
+        for physics_key, model_key in param_mapping.items():
+            value = params_dict.get(model_key)
+            if value is not None:
+                physics_params_for_loss[physics_key] = value
+
+        if params_dict.get('precip') is not None:
+            physics_params_for_loss['precip'] = params_dict['precip']
+
+        physics_params_for_loss['da_params'] = self.physics_params.get(
+            'drainage_area_kwargs',
+            self.physics_params.get('da_params', {})
+        )
+        return physics_params_for_loss
 
     def _run_epoch(self, epoch: int, is_training: bool) -> Tuple[float, Dict[str, float]]:
         """Runs a single epoch of training or validation."""
@@ -227,7 +255,11 @@ class PINNTrainer:
                     'D': batch_data_device.get('k_d'),
                     'U': batch_data_device.get('uplift_rate'),
                     'm': batch_data_device.get('m'), # Usually scalar
-                    'n': batch_data_device.get('n')  # Usually scalar
+                    'n': batch_data_device.get('n'),  # Usually scalar
+                    'precip': batch_data_device.get('precip', self.physics_params.get('precip', 1.0)),
+                    'dx': self.physics_params.get('dx', 1.0),
+                    'dy': self.physics_params.get('dy', 1.0),
+                    'da_params': self.physics_params.get('drainage_area_kwargs', {})
                 }
                 # Check for None values in params_dict if they are critical for the model
                 if params_dict['K'] is None or params_dict['D'] is None or params_dict['U'] is None:
@@ -236,11 +268,15 @@ class PINNTrainer:
                      # For now, let the model handle potential None values if it can.
 
                 t_target = batch_data_device.get('run_time')
+                dt = batch_data_device.get('dt', t_target)
                 if t_target is None:
                     # Estimate target time if not provided (e.g., use a default from config)
                     default_time = self.physics_params.get('total_time', 1.0) # Example default
                     t_target = torch.tensor(default_time, device=self.device, dtype=initial_state.dtype)
+                    dt = t_target
                     logging.debug("Using default total_time as t_target.")
+                elif dt is None:
+                    dt = t_target
 
                 model_input_state = {'initial_state': initial_state, 'params': params_dict, 't_target': t_target}
 
@@ -270,9 +306,7 @@ class PINNTrainer:
 
                             # Calculate Physics Loss (Dual Output)
                             # Pass necessary physics params for the loss function
-                            physics_params_for_loss = self.physics_params.copy()
-                            # Add da_params if they exist in main config's physics section
-                            physics_params_for_loss['da_params'] = self.physics_params.get('drainage_area_kwargs', {})
+                            physics_params_for_loss = self._build_physics_params_for_loss(params_dict)
 
                             physics_loss = compute_pde_residual_dual_output(
                                 outputs=model_outputs, # Pass the full output dict
@@ -287,7 +321,10 @@ class PINNTrainer:
                                 physics_loss_value=physics_loss,
                                 smoothness_pred=data_pred, # Use state prediction for smoothness
                                 physics_params=self.physics_params, # Pass dx, dy etc.
-                                loss_weights=current_loss_weights
+                                loss_weights=current_loss_weights,
+                                initial_topo=initial_state,
+                                derivative_pred=model_outputs['derivative'],
+                                dt=dt,
                             )
 
                         except Exception as e:
@@ -347,12 +384,14 @@ class PINNTrainer:
                      try:
                          model_outputs_log = self.model(model_input_state, mode='predict_state')
                          if isinstance(model_outputs_log, dict) and 'state' in model_outputs_log and 'derivative' in model_outputs_log:
-                              physics_params_log = self.physics_params.copy()
-                              physics_params_log['da_params'] = self.physics_params.get('drainage_area_kwargs', {})
+                              physics_params_log = self._build_physics_params_for_loss(params_dict)
                               physics_loss_log = compute_pde_residual_dual_output(model_outputs_log, physics_params_log)
                               _, loss_components_log = compute_total_loss(
                                    model_outputs_log['state'], final_topo, physics_loss_log, model_outputs_log['state'],
-                                   self.physics_params, self.loss_weight_scheduler.get_weights(epoch)
+                                   self.physics_params, self.loss_weight_scheduler.get_weights(epoch),
+                                   initial_topo=initial_state,
+                                   derivative_pred=model_outputs_log['derivative'],
+                                   dt=dt,
                               )
                               for key, value in loss_components_log.items():
                                    if isinstance(value, (int, float)) and not isinstance(value, bool) and not np.isnan(value):

@@ -7,8 +7,6 @@ import argparse
 import logging
 import os
 import sys
-import torch
-from typing import Dict, Optional, Tuple, Any, Union, List
 
 # 将项目根目录添加到 Python 路径
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -16,36 +14,28 @@ project_root = os.path.dirname(script_dir) # scripts 目录的上级是项目根
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-# 从新框架导入必要的模块
-try:
-    # 假设 utils, data_utils, models, trainer 都在 src 目录下
-    from src.utils import load_config, setup_logging, set_seed
-    from src.data_utils import create_dataloaders
-    from src.models import AdaptiveFastscapePINN # 直接导入主线模型
-    from src.trainer import PINNTrainer # 导入简化的训练器
-except ImportError as e:
-    print(f"错误：无法导入必要的模块: {e}。请确保你在 PINN_Framework 目录下运行，并且 src 目录包含所需文件。")
-    sys.exit(1)
-
 def main(args):
     """主函数，用于训练 PINN 模型。"""
+    try:
+        import torch
+        from src.utils import load_config, setup_logging, set_seed, normalize_training_config
+        from src.data_utils import create_dataloaders
+        from src.models import build_model_from_config, cast_floating_module_dtype
+        from src.trainer import PINNTrainer
+    except ImportError as e:
+        print(f"错误：无法导入必要的模块: {e}。请确保你在 PINN_Framework 目录下运行，并且环境依赖已安装。")
+        sys.exit(1)
+
     # --- 配置和日志设置 ---
     try:
-        config = load_config(args.config) # 使用 utils 中的加载函数 (返回 OmegaConf 对象)
+        config = normalize_training_config(load_config(args.config))
     except Exception as e:
         print(f"错误：无法加载配置文件 {args.config}: {e}")
         sys.exit(1)
 
-    # 使用 OmegaConf 访问配置，提供默认值
-    try:
-        from omegaconf import OmegaConf
-        if not isinstance(config, OmegaConf): config = OmegaConf.create(config)
-    except ImportError:
-        logging.warning("OmegaConf 未安装，使用标准字典访问。")
-
     train_config = config.get('training', {})
-    output_dir = config.get('output_dir', 'results/')
-    run_name = train_config.get('run_name', 'pinn_run') # Trainer 会处理默认值
+    output_dir = train_config.get('results_dir', config.get('output_dir', 'results/'))
+    run_name = train_config.get('run_name', 'pinn_run')
     log_dir = os.path.join(output_dir, run_name, 'logs')
     os.makedirs(log_dir, exist_ok=True)
     log_file_path = os.path.join(log_dir, 'train.log')
@@ -71,14 +61,12 @@ def main(args):
          logging.error(f"创建数据加载器失败: {e}", exc_info=True)
          sys.exit(1)
 
-    # --- 初始化模型 (固定为 AdaptiveFastscapePINN) ---
+    # --- 初始化模型 ---
     model_config = config.get('model', {}).copy() # 获取模型特定配置
-    # 移除不再需要的 'name' 字段（如果存在）
-    model_config.pop('name', None)
     model_dtype_str = model_config.pop('dtype', 'float32')
     model_dtype = torch.float32 if model_dtype_str == 'float32' else torch.float64
 
-    # AdaptiveFastscapePINN 需要 domain_x 和 domain_y
+    # 支持需要 domain_x/domain_y 的模型
     # 尝试从物理参数或数据配置中获取
     physics_params = config.get('physics', {})
     data_params = config.get('data', {})
@@ -100,13 +88,13 @@ def main(args):
     try:
         # 使用 **model_config 将剩余参数传递给模型构造函数
         # 确保传递给模型的配置是标准字典
-        model_config_dict = OmegaConf.to_container(model_config, resolve=True) if isinstance(model_config, OmegaConf) else model_config
-        model = AdaptiveFastscapePINN(**model_config_dict).to(dtype=model_dtype)
-        logging.info(f"已初始化模型: AdaptiveFastscapePINN")
+        model_config_dict = model_config
+        model = cast_floating_module_dtype(build_model_from_config(model_config_dict), model_dtype)
+        logging.info(f"已初始化模型: {model_config_dict.get('name', 'AdaptiveFastscapePINN')}")
         num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logging.info(f"模型可训练参数数量: {num_params:,}")
     except Exception as e:
-        logging.error(f"初始化 AdaptiveFastscapePINN 模型失败: {e}", exc_info=True)
+        logging.error(f"初始化模型失败: {e}", exc_info=True)
         logging.error(f"使用的模型配置: {model_config_dict if 'model_config_dict' in locals() else model_config}")
         sys.exit(1)
 
@@ -140,7 +128,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="训练 AdaptiveFastscapePINN 模型。")
+    parser = argparse.ArgumentParser(description="训练 PINN / Landscape operator 模型。")
     parser.add_argument('--config', type=str, required=True, help='配置文件的路径。')
     args = parser.parse_args()
     main(args)

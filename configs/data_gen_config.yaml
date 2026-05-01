@@ -3,7 +3,7 @@
 
 data_generation:
   num_samples: 10             # 每个分辨率要生成的样本数量
-  base_output_dir: data/processed10 # 保存处理后 .pt 文件的主目录 (相对路径)
+  base_output_dir: data/processed # 保存处理后 .pt 文件的主目录 (相对路径)
   num_workers: 10                # 新增：并行生成样本的工作进程数 (0 表示自动检测 CPU 核心数, 1 表示单进程)
   random_seed: 42                # 新增：用于可复现性的基础随机种子 (可选, None 表示不设置)
 
